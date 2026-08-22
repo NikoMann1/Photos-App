@@ -13,7 +13,7 @@
  * out is still a File, with its name and type intact.
  */
 
-import type { PhotoMeta, ScoreBreakdown } from "./scoring";
+import type { PhotoMeta, ScoredPhoto, Steering } from "./scoring";
 
 const DB_NAME = "photo-picker";
 const DB_VERSION = 1;
@@ -24,13 +24,15 @@ const MAX_AGE_MS = 60 * 60 * 1000;
 
 export type StoredPhoto = PhotoMeta & { file: File };
 
-/** What the scorer concluded about one photo, kept for the review screen. */
-export type StoredScore = {
-  id: string;
-  score: number;
-  breakdown: ScoreBreakdown;
-  rejectedFor: string | null;
-};
+/**
+ * Everything the scorer worked out about one photo, minus the file itself.
+ *
+ * The whole scored photo is kept, embedding included, so the review screen can
+ * re-choose when the user steers without re-running any analysis — the
+ * expensive stage costs ~300ms a photo and must not be repeated for a tap.
+ * A 512-float embedding is 2 KB, so a 50-photo batch adds well under 100 KB.
+ */
+export type StoredScore = Omit<ScoredPhoto, "takenAt"> & { takenAt: number | null };
 
 /** A burst: one frame kept, the rest set aside. */
 export type StoredDuplicateGroup = { bestId: string; alternateIds: string[] };
@@ -39,10 +41,14 @@ export type BrowserSession = {
   sessionId: string;
   createdAt: number;
   photos: StoredPhoto[];
-  /** Ids of the photos the scorer picked, best-first. */
+  /** Ids of the photos currently shown, after any steering. */
   selectedIds: string[];
   /** Every photo's score, best-first. */
   scores: StoredScore[];
+  /** Ids that survived duplicate collapsing — the pool steering re-chooses from. */
+  representativeIds: string[];
+  /** What the user has said about this batch so far. */
+  steering: Steering;
   duplicateGroups: StoredDuplicateGroup[];
   /** How many photos the quality bar rejected outright. */
   rejectedCount: number;
@@ -69,6 +75,17 @@ function promisify<T>(request: IDBRequest<T>): Promise<T> {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed"));
   });
+}
+
+/** Records a steering change without rewriting the photos themselves. */
+export async function updateSteering(
+  sessionId: string,
+  steering: Steering,
+  selectedIds: string[],
+): Promise<void> {
+  const session = await loadSession(sessionId);
+  if (!session) return;
+  await saveSession({ ...session, steering, selectedIds });
 }
 
 export async function saveSession(session: BrowserSession): Promise<void> {
