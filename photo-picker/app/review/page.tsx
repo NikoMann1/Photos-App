@@ -1,11 +1,17 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import PhotoGrid from "@/components/PhotoGrid";
 import SaveToPhotosButton, { type SharePhoto } from "@/components/SaveToPhotosButton";
-import { loadSession } from "@/lib/browser-session";
+import {
+  loadSession,
+  updateSteering,
+  type BrowserSession,
+  type StoredScore,
+} from "@/lib/browser-session";
+import { selectWithSteering, type ScoredPhoto, type Steering } from "@/lib/scoring";
 
 type Summary = {
   total: number;
@@ -13,21 +19,27 @@ type Summary = {
   burstCount: number;
   collapsedCount: number;
   unanalyzedCount: number;
+  steerable: boolean;
 };
 
-type State =
-  | { phase: "loading" }
-  | { phase: "missing" }
-  | {
-      phase: "ready";
-      photos: SharePhoto[];
-      scores: Map<string, { score: number; rejectedFor: string | null }>;
-      summary: Summary;
-    };
+type Loaded = {
+  sessionId: string;
+  /** Object URL per photo id, revoked on unmount. */
+  urls: Map<string, string>;
+  files: Map<string, File>;
+  names: Map<string, string>;
+  types: Map<string, string>;
+  scored: StoredScore[];
+  pool: StoredScore[];
+  summary: Summary;
+};
+
+type State = { phase: "loading" } | { phase: "missing" } | { phase: "ready"; data: Loaded };
 
 function Review() {
   const sessionId = useSearchParams().get("session");
   const [state, setState] = useState<State>({ phase: "loading" });
+  const [steering, setSteering] = useState<Steering>({ liked: [], rejected: [] });
   const [showScores, setShowScores] = useState(false);
 
   useEffect(() => {
@@ -37,61 +49,108 @@ function Review() {
     }
 
     let cancelled = false;
-    // Object URLs are created here and revoked on unmount, so the grid and the
-    // download fallback can point at the browser's own copies of the photos.
-    let urls: string[] = [];
+    let created: string[] = [];
 
     (async () => {
-      const session = await loadSession(sessionId).catch(() => null);
+      const session: BrowserSession | null = await loadSession(sessionId).catch(() => null);
       if (cancelled) return;
-
       if (!session) {
         setState({ phase: "missing" });
         return;
       }
 
-      const selectedIds = new Set(session.selectedIds);
-      const selected = session.photos.filter((photo) => selectedIds.has(photo.id));
-      const photos: SharePhoto[] = selected.map((photo) => {
+      const urls = new Map<string, string>();
+      const files = new Map<string, File>();
+      const names = new Map<string, string>();
+      const types = new Map<string, string>();
+      for (const photo of session.photos) {
         const url = URL.createObjectURL(photo.file);
-        urls.push(url);
-        return { id: photo.id, name: photo.name, type: photo.type, file: photo.file, url };
-      });
+        created.push(url);
+        urls.set(photo.id, url);
+        files.set(photo.id, photo.file);
+        names.set(photo.id, photo.name);
+        types.set(photo.id, photo.type);
+      }
 
-      const scores = new Map(
-        session.scores.map((entry) => [
-          entry.id,
-          { score: entry.score, rejectedFor: entry.rejectedFor },
-        ]),
+      const representatives = new Set(session.representativeIds ?? []);
+      const pool = session.scores.filter(
+        (photo) => representatives.has(photo.id) && photo.rejectedFor === null,
       );
 
+      setSteering(session.steering ?? { liked: [], rejected: [] });
       setState({
         phase: "ready",
-        photos,
-        scores,
-        summary: {
-          total: session.photos.length,
-          rejectedCount: session.rejectedCount,
-          burstCount: session.duplicateGroups.length,
-          collapsedCount: session.duplicateGroups.reduce(
-            (sum, group) => sum + group.alternateIds.length,
-            0,
-          ),
-          unanalyzedCount: session.unanalyzedIds.length,
+        data: {
+          sessionId,
+          urls,
+          files,
+          names,
+          types,
+          scored: session.scores,
+          pool: pool.length > 0 ? pool : session.scores,
+          summary: {
+            total: session.photos.length,
+            rejectedCount: session.rejectedCount,
+            burstCount: session.duplicateGroups.length,
+            collapsedCount: session.duplicateGroups.reduce(
+              (sum, group) => sum + group.alternateIds.length,
+              0,
+            ),
+            unanalyzedCount: session.unanalyzedIds.length,
+            // Steering needs embeddings to reason about; without them a tap
+            // could only pin and drop, which is not worth the interface.
+            steerable: session.scores.some((photo) => photo.embedding),
+          },
         },
       });
     })();
 
     return () => {
       cancelled = true;
-      for (const url of urls) URL.revokeObjectURL(url);
-      urls = [];
+      for (const url of created) URL.revokeObjectURL(url);
+      created = [];
     };
   }, [sessionId]);
 
-  if (state.phase === "loading") {
-    return <p className="muted">Loading…</p>;
-  }
+  const data = state.phase === "ready" ? state.data : null;
+
+  // Re-choose locally on every tap: the expensive analysis already ran, so
+  // this is a few thousand dot products, not another pass over the photos.
+  const selected = useMemo(() => {
+    if (!data) return [];
+    return selectWithSteering(data.pool as unknown as ScoredPhoto[], steering);
+  }, [data, steering]);
+
+  useEffect(() => {
+    if (!data || selected.length === 0) return;
+    void updateSteering(
+      data.sessionId,
+      steering,
+      selected.map((photo) => photo.id),
+    );
+  }, [data, steering, selected]);
+
+  const steer = useCallback((id: string, action: "like" | "reject") => {
+    setSteering((current) => {
+      const liked = new Set(current.liked);
+      const rejected = new Set(current.rejected);
+
+      if (action === "like") {
+        rejected.delete(id);
+        // Tapping an already-liked photo takes the opinion back.
+        if (liked.has(id)) liked.delete(id);
+        else liked.add(id);
+      } else {
+        liked.delete(id);
+        if (rejected.has(id)) rejected.delete(id);
+        else rejected.add(id);
+      }
+
+      return { liked: [...liked], rejected: [...rejected] };
+    });
+  }, []);
+
+  if (state.phase === "loading") return <p className="muted">Loading…</p>;
 
   if (state.phase === "missing") {
     return (
@@ -109,22 +168,38 @@ function Review() {
     );
   }
 
-  const { summary } = state;
-  const gridPhotos = state.photos.map((photo) => {
-    const score = state.scores.get(photo.id);
-    return {
-      ...photo,
-      badge: showScores && score ? score.score.toFixed(2) : undefined,
-      note: showScores ? score?.rejectedFor ?? null : null,
-    };
-  });
+  const { summary, urls, files, names, types } = state.data;
+  const likedIds = new Set(steering.liked);
+
+  // Defensive: a scored id with no file behind it would hand undefined to the
+  // share sheet. It should not happen, but it must not be able to.
+  const shown = selected.filter((photo) => files.has(photo.id) && urls.has(photo.id));
+
+  const sharePhotos: SharePhoto[] = shown.map((photo) => ({
+    id: photo.id,
+    name: names.get(photo.id) ?? `${photo.id}.jpg`,
+    type: types.get(photo.id) ?? "image/jpeg",
+    file: files.get(photo.id)!,
+    url: urls.get(photo.id)!,
+  }));
+
+  const gridPhotos = shown.map((photo) => ({
+    id: photo.id,
+    name: names.get(photo.id) ?? photo.id,
+    url: urls.get(photo.id)!,
+    badge: showScores ? photo.score.toFixed(2) : undefined,
+    note: showScores ? photo.rejectedFor : null,
+    liked: likedIds.has(photo.id),
+    onLike: summary.steerable ? () => steer(photo.id, "like") : undefined,
+    onReject: summary.steerable ? () => steer(photo.id, "reject") : undefined,
+  }));
 
   return (
     <div className="stack">
       <header className="stack tight">
         <h1>Best photos</h1>
         <p className="muted">
-          {state.photos.length} of {summary.total} photos.
+          {shown.length} of {summary.total} photos.
         </p>
         <ul className="reasons small">
           {summary.collapsedCount > 0 && (
@@ -145,15 +220,34 @@ function Review() {
 
       <PhotoGrid photos={gridPhotos} />
 
-      <button
-        type="button"
-        className="link-button small"
-        onClick={() => setShowScores((shown) => !shown)}
-      >
-        {showScores ? "Hide scores" : "Show scores"}
-      </button>
+      {summary.steerable && (
+        <p className="muted small">
+          Tap <strong>♥</strong> to keep a photo and get more like it, <strong>✕</strong> to
+          drop it and photos like it. The rest re-shuffle around your choices.
+          {steering.rejected.length > 0 && ` ${steering.rejected.length} dropped.`}
+        </p>
+      )}
 
-      <SaveToPhotosButton photos={state.photos} />
+      <div className="row">
+        <button
+          type="button"
+          className="link-button small"
+          onClick={() => setShowScores((shown) => !shown)}
+        >
+          {showScores ? "Hide scores" : "Show scores"}
+        </button>
+        {(steering.liked.length > 0 || steering.rejected.length > 0) && (
+          <button
+            type="button"
+            className="link-button small"
+            onClick={() => setSteering({ liked: [], rejected: [] })}
+          >
+            Reset choices
+          </button>
+        )}
+      </div>
+
+      <SaveToPhotosButton photos={sharePhotos} />
 
       <Link className="button" href="/">
         Upload another batch

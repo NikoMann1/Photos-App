@@ -402,9 +402,19 @@ export function similarity(a: ScoredPhoto, b: ScoredPhoto): number {
  * The cost is O(count × pool × chosen), which for a few hundred photos and ten
  * slots is a few thousand cheap comparisons.
  */
-export function selectDiverse(candidates: ScoredPhoto[], count: number): ScoredPhoto[] {
-  const pool = [...candidates];
-  const chosen: ScoredPhoto[] = [];
+export function selectDiverse(
+  candidates: ScoredPhoto[],
+  count: number,
+  /** Already-chosen photos: kept, and counted against everything else's novelty. */
+  seeds: ScoredPhoto[] = [],
+  /** Ranking value, so steering can bias without mutating the stored score. */
+  valueOf: (photo: ScoredPhoto) => number = (photo) => photo.score,
+  /** Scales the novelty penalty, so steering can make repetition cheaper. */
+  noveltyDiscount: (photo: ScoredPhoto) => number = () => 1,
+): ScoredPhoto[] {
+  const seedIds = new Set(seeds.map((photo) => photo.id));
+  const pool = candidates.filter((photo) => !seedIds.has(photo.id));
+  const chosen: ScoredPhoto[] = [...seeds];
 
   while (chosen.length < count && pool.length > 0) {
     let bestIndex = 0;
@@ -415,7 +425,7 @@ export function selectDiverse(candidates: ScoredPhoto[], count: number): ScoredP
       for (const already of chosen) {
         penalty = Math.max(penalty, similarity(pool[i], already));
       }
-      const value = pool[i].score - DIVERSITY_WEIGHT * penalty;
+      const value = valueOf(pool[i]) - DIVERSITY_WEIGHT * penalty * noveltyDiscount(pool[i]);
       if (value > bestValue) {
         bestValue = value;
         bestIndex = i;
@@ -427,6 +437,110 @@ export function selectDiverse(candidates: ScoredPhoto[], count: number): ScoredP
   }
 
   return chosen;
+}
+
+// ---------------------------------------------------------------------------
+// Steering
+// ---------------------------------------------------------------------------
+
+/**
+ * What the user said about the last selection. Ids, so it survives a reload.
+ */
+export type Steering = { liked: string[]; rejected: string[] };
+
+export const NO_STEERING: Steering = { liked: [], rejected: [] };
+
+/**
+ * A rejection is unambiguous, so it subtracts directly and hard — far harder
+ * than the ~0.04 spread of the technical score across a real batch.
+ */
+const REJECT_WEIGHT = 0.5;
+
+/**
+ * A like is *not* modelled as a bonus, because a bonus fights the novelty
+ * penalty photo-for-photo and simply beats it: with a large enough bonus,
+ * liking one photo returns five near-copies of it, which is the redundancy
+ * diverse selection exists to prevent. A smaller bonus instead inverts the
+ * intent, ranking unrelated subjects above the liked one, since they are
+ * penalised least.
+ *
+ * So a like discounts the novelty penalty rather than opposing it. Coverage
+ * still decides the early picks, and photos resembling something the user
+ * liked become progressively cheaper to repeat — meaning surplus slots go to
+ * what they asked for, without collapsing the spread.
+ *
+ * The value matters: above roughly 0.72, repeating the liked subject becomes
+ * cheaper than covering a new one and the results collapse into near-copies
+ * again. 0.5 leaves real headroom under that cliff rather than sitting on it.
+ */
+const LIKE_RELIEF = 0.5;
+
+/** Cosine, remapped so 0.19 (unrelated) is 0 and 1.0 (identical) is 1. */
+function contentAffinity(photo: ScoredPhoto, reference: Float32Array | null): number {
+  if (!photo.embedding || !reference) return 0;
+  return Math.max(0, Math.min(1, (embeddingSimilarity(photo.embedding, reference) - 0.19) / 0.81));
+}
+
+/** Mean direction of a set of embeddings, renormalised to unit length. */
+function meanEmbedding(photos: ScoredPhoto[]): Float32Array | null {
+  const withEmbedding = photos.filter((photo) => photo.embedding);
+  if (withEmbedding.length === 0) return null;
+
+  const dims = withEmbedding[0].embedding!.length;
+  const sum = new Float32Array(dims);
+  for (const photo of withEmbedding) {
+    const embedding = photo.embedding!;
+    for (let i = 0; i < dims; i++) sum[i] += embedding[i];
+  }
+
+  let norm = 0;
+  for (const v of sum) norm += v * v;
+  norm = Math.sqrt(norm);
+  if (norm === 0) return null;
+
+  for (let i = 0; i < dims; i++) sum[i] /= norm;
+  return sum;
+}
+
+/**
+ * Re-chooses a selection given what the user liked and rejected.
+ *
+ * Liked photos are pinned — a tap should never be undone by the next
+ * recalculation — and also pull similar photos up. Rejected photos are dropped
+ * and push similar photos down. Everything else is the usual diverse selection,
+ * so the remaining slots still spread across subjects rather than filling up
+ * with near-copies of whatever was liked.
+ *
+ * Photos with no embedding are unaffected by steering rather than penalised by
+ * it: not knowing what a photo shows is not evidence against it.
+ */
+export function selectWithSteering(
+  candidates: ScoredPhoto[],
+  steering: Steering,
+  ratio: number = SELECTION_RATIO,
+): ScoredPhoto[] {
+  const liked = new Set(steering.liked);
+  const rejected = new Set(steering.rejected);
+
+  const pool = candidates.filter((photo) => !rejected.has(photo.id));
+  const seeds = candidates.filter((photo) => liked.has(photo.id));
+  const wanted = Math.max(selectionSize(pool.length, ratio), seeds.length);
+
+  const likedDirection = meanEmbedding(seeds);
+  const rejectedPhotos = candidates.filter((photo) => rejected.has(photo.id));
+
+  const valueOf = (photo: ScoredPhoto) => {
+    let unwanted = 0;
+    for (const reject of rejectedPhotos) {
+      unwanted = Math.max(unwanted, contentAffinity(photo, reject.embedding ?? null));
+    }
+    return photo.score - REJECT_WEIGHT * unwanted;
+  };
+
+  const noveltyDiscount = (photo: ScoredPhoto) =>
+    1 - LIKE_RELIEF * contentAffinity(photo, likedDirection);
+
+  return selectDiverse(pool, wanted, seeds, valueOf, noveltyDiscount);
 }
 
 // ---------------------------------------------------------------------------

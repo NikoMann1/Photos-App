@@ -212,3 +212,45 @@ details.card summary {
 details.card[open] summary {
   margin-bottom: 12px;
 }
+
+/* Steering controls sit on the thumbnail, so they need to stay legible over
+   any photo — hence the scrim rather than a flat colour. */
+.tile-action {
+  position: absolute;
+  bottom: 4px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+  backdrop-filter: blur(2px);
+}
+
+.tile-action.drop {
+  left: 4px;
+}
+
+.tile-action.keep {
+  right: 4px;
+}
+
+.tile-action.keep.on {
+  background: var(--accent);
+}
+
+.grid-item.liked {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.row {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+}

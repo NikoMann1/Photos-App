@@ -301,6 +301,33 @@ binaries do not belong in a git repository. To self-host, serve them and set
 If either fetch fails the app still works: photos without embeddings fall back
 to colour, layout and time, which is covered by a test.
 
+## Steering
+
+Tapping **♥** keeps a photo and makes similar ones cheaper to include; **✕**
+drops it and pushes its whole subject down. Choices persist with the batch and
+survive a reload, and **Reset choices** clears them.
+
+This is the only signal in the system that comes from the person looking at the
+photos rather than from a guess about taste — which matters, because the guess
+was tried and failed (see the aesthetic prompts above).
+
+A like is deliberately **not** a score bonus. A bonus fights the novelty penalty
+photo-for-photo and simply beats it: liking one photo then returns five
+near-copies of it, undoing diverse selection. Making the bonus smaller inverts
+the intent instead, ranking unrelated subjects above the liked one because they
+are penalised least. So a like *discounts the novelty penalty* rather than
+opposing it. Coverage still decides the early picks; photos resembling
+something liked become cheaper to repeat, so surplus slots go where the user
+pointed.
+
+`LIKE_RELIEF` is load-bearing: above roughly 0.72, repeating the liked subject
+becomes cheaper than covering a new one and the results collapse into
+near-copies again. It sits at 0.5 to leave headroom under that cliff. A
+rejection, being unambiguous, is a straight penalty.
+
+Steering degrades rather than misbehaves without embeddings: the controls only
+appear when the model ran, and pinning and dropping still work if it did not.
+
 ## Still not solved: judgement
 
 None of this can tell a striking composition from a well-exposed photo of

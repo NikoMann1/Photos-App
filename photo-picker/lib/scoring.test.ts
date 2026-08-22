@@ -8,9 +8,11 @@ import {
   scorePhoto,
   selectBestPhotos,
   selectionSize,
+  selectWithSteering,
   shortlistForEmbedding,
   similarity,
   type AnalyzedPhoto,
+  type ScoredPhoto,
 } from "./scoring";
 
 /** A unit vector pointing `angle` radians from the first axis. */
@@ -309,4 +311,90 @@ test("the embedding shortlist covers the contenders, not the whole batch", () =>
     shortlist.every((p) => p.rejectedFor === null),
     "no point embedding photos the quality bar already rejected",
   );
+});
+
+/** Scored photos in one of three content directions, for steering tests. */
+function subject(direction: number, count: number, prefix: string): ScoredPhoto[] {
+  return Array.from({ length: count }, (_, i) =>
+    scorePhoto(
+      photo(
+        { colorSignature: Array.from({ length: 32 }, () => (direction * 60 + i * 3) % 250) },
+        { id: `${prefix}${i}`, embedding: embeddingAt((direction * Math.PI) / 3) },
+      ),
+    ),
+  );
+}
+
+test("liking a photo keeps it and pulls in more of the same subject", () => {
+  const boats = subject(0, 6, "boat");
+  const rooms = subject(1, 6, "room");
+  const signs = subject(2, 6, "sign");
+  const all = [...boats, ...rooms, ...signs];
+
+  const neutral = selectWithSteering(all, { liked: [], rejected: [] });
+  const steered = selectWithSteering(all, { liked: ["boat0"], rejected: [] });
+
+  assert.ok(steered.some((p) => p.id === "boat0"), "a liked photo must always survive");
+
+  const boatsBefore = neutral.filter((p) => p.id.startsWith("boat")).length;
+  const boatsAfter = steered.filter((p) => p.id.startsWith("boat")).length;
+  assert.ok(
+    boatsAfter > boatsBefore,
+    `liking a boat should surface more boats, got ${boatsBefore} → ${boatsAfter}`,
+  );
+});
+
+test("rejecting a photo removes it and pushes down its whole subject", () => {
+  const boats = subject(0, 6, "boat");
+  const rooms = subject(1, 6, "room");
+  const all = [...boats, ...rooms];
+
+  const neutral = selectWithSteering(all, { liked: [], rejected: [] });
+  assert.ok(neutral.some((p) => p.id.startsWith("boat")), "boats start out represented");
+
+  const steered = selectWithSteering(all, { liked: [], rejected: ["boat0"] });
+  assert.ok(!steered.some((p) => p.id === "boat0"), "a rejected photo must not come back");
+
+  const boatsBefore = neutral.filter((p) => p.id.startsWith("boat")).length;
+  const boatsAfter = steered.filter((p) => p.id.startsWith("boat")).length;
+  assert.ok(
+    boatsAfter < boatsBefore,
+    `rejecting a boat should surface fewer boats, got ${boatsBefore} → ${boatsAfter}`,
+  );
+});
+
+test("steering still spreads across subjects rather than returning copies", () => {
+  // The failure this guards against: liking one photo floods the results with
+  // near-identical versions of it, undoing diverse selection.
+  const boats = subject(0, 10, "boat");
+  const rooms = subject(1, 5, "room");
+
+  const steered = selectWithSteering([...boats, ...rooms], { liked: ["boat0"], rejected: [] });
+  assert.ok(
+    steered.some((p) => p.id.startsWith("room")),
+    "diversity must survive a like: results should not be all one subject",
+  );
+});
+
+test("liked photos are kept even when the batch is smaller than the floor", () => {
+  const photos = subject(0, 3, "p");
+  const steered = selectWithSteering(photos, { liked: ["p2"], rejected: [] });
+  assert.ok(steered.some((p) => p.id === "p2"));
+  assert.ok(steered.length <= photos.length);
+});
+
+test("steering is inert without embeddings rather than destructive", () => {
+  // No model: a tap can still pin and drop, but must not reorder by guesswork.
+  const plain = Array.from({ length: 8 }, (_, i) =>
+    scorePhoto(
+      photo(
+        { colorSignature: Array.from({ length: 32 }, () => (i * 30) % 250) },
+        { id: `p${i}`, embedding: null },
+      ),
+    ),
+  );
+
+  const steered = selectWithSteering(plain, { liked: ["p3"], rejected: ["p0"] });
+  assert.ok(steered.some((p) => p.id === "p3"), "pinning works without a model");
+  assert.ok(!steered.some((p) => p.id === "p0"), "dropping works without a model");
 });

@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
+  NO_STEERING,
   selectBestPhotos,
   selectionSize,
   shortlistForEmbedding,
@@ -145,12 +146,19 @@ export default function PhotoUploader() {
         createdAt: Date.now(),
         photos,
         selectedIds,
-        scores: selection.ranked.map(({ id, score, breakdown, rejectedFor }) => ({
-          id,
-          score,
-          breakdown,
-          rejectedFor,
-        })),
+        scores: selection.ranked.map((photo) => ({ ...photo, takenAt: photo.takenAt ?? null })),
+        representativeIds: [
+          ...selection.duplicateGroups.map((group) => group.best.id),
+          ...selection.ranked
+            .filter(
+              (photo) =>
+                !selection.duplicateGroups.some((group) =>
+                  group.alternates.some((alternate) => alternate.id === photo.id),
+                ),
+            )
+            .map((photo) => photo.id),
+        ].filter((id, index, all) => all.indexOf(id) === index),
+        steering: NO_STEERING,
         duplicateGroups: selection.duplicateGroups.map((group) => ({
           bestId: group.best.id,
           alternateIds: group.alternates.map((photo) => photo.id),
