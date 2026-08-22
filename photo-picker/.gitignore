@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+build/
+certificates/
+*.pem
+.env*.local
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+.uploads/
