@@ -13,7 +13,7 @@
  * out is still a File, with its name and type intact.
  */
 
-import type { PhotoMeta } from "./scoring";
+import type { PhotoMeta, ScoreBreakdown } from "./scoring";
 
 const DB_NAME = "photo-picker";
 const DB_VERSION = 1;
@@ -24,12 +24,30 @@ const MAX_AGE_MS = 60 * 60 * 1000;
 
 export type StoredPhoto = PhotoMeta & { file: File };
 
+/** What the scorer concluded about one photo, kept for the review screen. */
+export type StoredScore = {
+  id: string;
+  score: number;
+  breakdown: ScoreBreakdown;
+  rejectedFor: string | null;
+};
+
+/** A burst: one frame kept, the rest set aside. */
+export type StoredDuplicateGroup = { bestId: string; alternateIds: string[] };
+
 export type BrowserSession = {
   sessionId: string;
   createdAt: number;
   photos: StoredPhoto[];
-  /** Ids of the photos the (placeholder) scorer picked. */
+  /** Ids of the photos the scorer picked, best-first. */
   selectedIds: string[];
+  /** Every photo's score, best-first. */
+  scores: StoredScore[];
+  duplicateGroups: StoredDuplicateGroup[];
+  /** How many photos the quality bar rejected outright. */
+  rejectedCount: number;
+  /** Photos whose pixels could not be decoded, so they were never scored. */
+  unanalyzedIds: string[];
 };
 
 function openDb(): Promise<IDBDatabase> {

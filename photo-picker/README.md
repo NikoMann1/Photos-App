@@ -1,12 +1,12 @@
-# photo-picker — milestone 1 skeleton
+# photo-picker
 
-An end-to-end skeleton of the trip-photo picker: upload a batch of photos, get a
-"best" subset back, and save them to the iPhone camera roll via the iOS share
-sheet.
+Pick a batch of trip photos, get the best ones back, save them to the iPhone
+camera roll via the iOS share sheet. Everything runs on the device.
 
-**The scoring is fake on purpose.** `lib/scoring.ts` returns a random ~10% of
-what you uploaded. The whole point of this milestone is to prove the
-save-to-Photos path on a real device before any ML work starts.
+- **Milestone 1** (done): end-to-end skeleton, proving the save-to-Photos path
+  on a real iPhone.
+- **Milestone 2** (this): real scoring — focus, exposure, tonal range, colour,
+  and near-duplicate collapsing. See [Scoring](#scoring).
 
 ## Structure
 
@@ -19,7 +19,13 @@ photo-picker/
 │       ├── upload/route.ts                   # Receives photos, stores + scores
 │       └── photos/[sessionId]/[photoId]/     # Serves a stored photo back
 ├── lib/
-│   ├── scoring.ts                            # PLACEHOLDER selection logic
+│   ├── scoring.ts                            # Scoring, dedup, selection
+│   ├── analysis/
+│   │   ├── metrics.ts                        # Pure pixel measurements
+│   │   ├── decode.ts                         # Photo → downscaled pixels
+│   │   ├── exif.ts                           # Capture time, for bursts
+│   │   ├── worker.ts                         # Off-main-thread analysis
+│   │   └── index.ts                          # Worker pool + fallback
 │   ├── browser-session.ts                    # Photos held in the browser
 │   └── storage.ts                            # Temp server-side file storage
 ├── components/
@@ -143,34 +149,98 @@ Photos.
 If the button says "Preparing photos…" it's still fetching the image bytes; it
 enables when they're in hand. That's deliberate — see below.
 
-## Notes for the next milestone
+## Scoring
+
+Analysis runs in the browser, in a pool of up to four workers, on photos
+downscaled to 512px. A 19-photo batch measures in about 300 ms on a laptop.
+
+Everything measured is *technical* quality — `lib/analysis/metrics.ts` is pure
+functions over raw pixels, so it is unit-testable without a browser:
+
+| Signal | What it catches |
+| --- | --- |
+| `focus` | Blur and missed focus (variance of the Laplacian) |
+| `noiseRatio` | Grain masquerading as detail |
+| exposure | Blown highlights, crushed shadows, too dark or bright |
+| tone | Flat, hazy frames with no tonal range |
+| colour | Vivid versus washed out, weighted lightly |
+| `hash` + `colorSignature` | Near-duplicates and bursts |
+
+Selection then runs in three stages: **collapse near-duplicates** (so a burst
+of ten spends one slot, not ten), **drop anything below an absolute quality
+bar**, then **rank what survives** and take the top N.
+
+### Three things that bit during calibration
+
+Each of these had a test written against it, so they cannot come back quietly:
+
+1. **Sharpness moves with exposure.** A raw Laplacian scales with pixel
+   magnitude, so brightening a photo made it measure *twice as sharp* as the
+   original it came from. Normalising by contrast² fixes it — but then a
+   near-flat frame divides by almost nothing and a blurred photo measured
+   sharper than a good one. Both measures are now combined by taking the worse.
+
+2. **Grain reads as detail.** Pure noise scored 0.97 and ranked first in the
+   batch. Comparing high-frequency energy before and after halving the
+   resolution separates the two: real detail survives downsampling, grain
+   averages away (0.5–0.8 for real photos, 2.9 grainy, 4.0 pure noise).
+
+3. **An 8×8 hash merges unrelated photos.** Anything with one dominant
+   gradient — a sky, a sunset, a wall — makes every "brighter than the pixel to
+   its right" comparison answer the same way, so the hash degenerates towards
+   all-ones and unrelated photos land a bit or two apart. In one test batch, 17
+   of 22 photos collapsed into 2 groups. Now: a 256-bit hash, a
+   brightness-invariant colour signature, an explicit degenerate-hash check,
+   and a timestamp guard for the looser threshold. Merging errs towards keeping
+   photos apart — an uncollapsed burst costs a slot, a wrong merge silently
+   destroys a photo the user never sees.
+
+### Tuning
+
+Thresholds are named constants at the top of `lib/scoring.ts`, each with the
+measurement that produced it. They were calibrated against a small corpus, so
+expect to adjust them against a real trip batch — `SHARPNESS_FLOOR` in
+particular decides what counts as "too soft to keep".
+
+Tap **Show scores** on the review screen to see each photo's score and why the
+bar rejected it.
+
+```bash
+npm test        # 18 tests, no fixtures or image libraries needed
+```
+
+## Still not solved: aesthetic quality
+
+None of this can tell a striking composition from a well-exposed photo of
+nothing. A boring-but-sharp frame outranks an interesting one with slight
+motion blur.
+
+That is also why the count is still governed by a ratio (`SELECTION_RATIO`,
+floored at 5 and capped at 50) rather than falling out of the quality bar: on
+technical merit alone most of a decent batch passes, so "keep everything above
+the bar" would hand back nearly everything. Selecting purely by an absolute bar
+becomes right once the score captures interestingness — a small on-device
+aesthetic model (NIMA-style, a few MB via ONNX Runtime Web or TFJS) is the
+natural next step, at which point the floor and cap become guardrails rather
+than the deciding factor.
+
+## Other notes
 
 - **Keep the share call synchronous.** Safari requires `navigator.share()` to
   be called while the user gesture is still live; an `await` before it consumes
-  that activation and the call fails with `NotAllowedError`. `SaveToPhotosButton`
-  has zero async before `share()`. If real scoring ever moves the photos back
-  behind a server round trip, prefetch the `File` objects on mount rather than
-  fetching them in the click handler — this is the single easiest thing here to
-  break.
+  that activation and the call fails with `NotAllowedError`.
+  `SaveToPhotosButton` has zero async before `share()`.
 - **`allowedDevOrigins`.** Next's dev server 403s `/_next/*` requests from
-  non-allowlisted hosts. Loading from the phone is exactly that: the HTML
+  non-allowlisted hosts. Loading from a phone is exactly that: the HTML
   arrives, every JS chunk 403s, and the page never hydrates — the file picker
   just does nothing. `next.config.ts` allowlists private IP ranges, `*.local`,
-  this machine's detected addresses, and the tunnel hostnames.
-- **Server uploads are batched** 5 files per POST, sequentially (when the flag
-  above is on). A 30-photo batch off a phone is a few hundred MB in one request
-  otherwise, and batching gives real progress. The server appends to `meta.json`
-  without a lock, so those requests must not be parallelized.
-- **Replacing the scorer**: `selectBestPhotos(photos)` in `lib/scoring.ts` is
-  the only thing the API route calls. Per-photo scoring and selection are split
-  so blur/duplicate/aesthetic work can slot into `scorePhoto` without touching
-  the route or the UI. It currently runs on the metadata only — real scoring
-  will need the pixels, so expect it to become async and read from
-  `lib/storage.ts`.
+  this machine's detected addresses, and tunnel hostnames.
+- **Server uploads are batched** 5 files per POST, sequentially, when
+  `NEXT_PUBLIC_UPLOAD_TO_SERVER=1`. The server appends to `meta.json` without a
+  lock, so those requests must not be parallelized.
 - **Not done yet**: no HEIC handling (Safari usually transcodes to JPEG when
   picking, but not always), no auth, and 500-photo batches are untested — 20–30
-  is the tested range. Browser storage prunes sessions older than an hour;
-  server-side temp directories are left for the OS to reap.
+  is the tested range. Browser storage prunes sessions older than an hour.
 
 ## Troubleshooting
 

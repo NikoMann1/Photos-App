@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { appendPhotos, readSession, setSelection } from "@/lib/storage";
-import { selectBestPhotos } from "@/lib/scoring";
+import { appendPhotos, finalizeSession, readSession } from "@/lib/storage";
 
 // Photos are written to disk, so this must run on the Node.js runtime, and it
 // must never be statically optimized.
@@ -17,12 +16,12 @@ export type UploadResponse = {
 export type SessionResponse = {
   sessionId: string;
   total: number;
-  selected: Array<{
+  finalized: boolean;
+  photos: Array<{
     id: string;
     name: string;
     type: string;
     size: number;
-    score: number;
     url: string;
   }>;
 };
@@ -33,8 +32,10 @@ export type SessionResponse = {
  * The client uploads in small sequential batches (see PhotoUploader) rather
  * than one giant multipart request: it keeps a 30-photo upload from an iPhone
  * on wifi from being a single multi-hundred-megabyte POST, and it gives us
- * real progress. The last batch is sent with `finalize=1`, which is when
- * scoring runs.
+ * real progress. The last batch is sent with `finalize=1`.
+ *
+ * Scoring does not happen here — it needs decoded pixels, and those live in
+ * the browser. See `lib/analysis/`.
  */
 export async function POST(request: Request): Promise<NextResponse> {
   let form: FormData;
@@ -62,8 +63,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     }
 
     if (finalize) {
-      // Placeholder scoring — swap in the real thing in milestone 2.
-      session = await setSelection(sessionId, selectBestPhotos(session.photos));
+      session = await finalizeSession(sessionId);
     }
 
     const body: UploadResponse = {
@@ -90,14 +90,11 @@ export async function GET(request: Request): Promise<NextResponse> {
   if (!session) {
     return NextResponse.json({ error: "Unknown session" }, { status: 404 });
   }
-  if (!session.selected) {
-    return NextResponse.json({ error: "Session not finalized yet" }, { status: 409 });
-  }
-
   const body: SessionResponse = {
     sessionId,
     total: session.photos.length,
-    selected: session.selected.map((photo) => ({
+    finalized: session.finalized,
+    photos: session.photos.map((photo) => ({
       ...photo,
       url: `/api/photos/${sessionId}/${photo.id}`,
     })),

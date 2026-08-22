@@ -2,7 +2,8 @@
 
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { selectBestPhotos, type PhotoMeta } from "@/lib/scoring";
+import { selectBestPhotos, type AnalyzedPhoto } from "@/lib/scoring";
+import { analyzePhotos } from "@/lib/analysis";
 import { isStorageAvailable, saveSession, type StoredPhoto } from "@/lib/browser-session";
 
 /**
@@ -26,6 +27,9 @@ type Status =
   | { phase: "idle" }
   | { phase: "working"; label: string; done: number; total: number }
   | { phase: "error"; message: string };
+
+/** Analysis is the slow step, so it gets its own progress rather than a spinner. */
+const ANALYZING = "Analyzing";
 
 export default function PhotoUploader() {
   const router = useRouter();
@@ -53,8 +57,6 @@ export default function PhotoUploader() {
         );
       }
 
-      setStatus({ phase: "working", label: "Preparing", done: 0, total: files.length });
-
       const photos: StoredPhoto[] = files.map((file, index) => ({
         id: `p${String(index).padStart(4, "0")}`,
         name: file.name || `photo-${index + 1}.jpg`,
@@ -63,12 +65,52 @@ export default function PhotoUploader() {
         file,
       }));
 
-      // Placeholder scoring — swap in the real thing in milestone 2.
-      const metas: PhotoMeta[] = photos.map(({ file: _file, ...meta }) => meta);
-      const selectedIds = selectBestPhotos(metas).map((photo) => photo.id);
+      setStatus({ phase: "working", label: ANALYZING, done: 0, total: files.length });
 
-      await saveSession({ sessionId, createdAt: Date.now(), photos, selectedIds });
-      setStatus({ phase: "working", label: "Preparing", done: files.length, total: files.length });
+      const analyses = await analyzePhotos(
+        photos.map(({ id, file }) => ({ id, file })),
+        (done, total) => setStatus({ phase: "working", label: ANALYZING, done, total }),
+      );
+
+      // A photo whose pixels wouldn't decode can't be scored. Keep it in the
+      // session — it is still the user's photo — but leave it out of ranking
+      // rather than guessing a score for it.
+      const byId = new Map(photos.map((photo) => [photo.id, photo]));
+      const analyzed: AnalyzedPhoto[] = [];
+      const unanalyzedIds: string[] = [];
+
+      for (const analysis of analyses) {
+        const photo = byId.get(analysis.id);
+        if (!photo) continue;
+        if (!analysis.metrics) {
+          unanalyzedIds.push(analysis.id);
+          continue;
+        }
+        const { file: _file, ...meta } = photo;
+        analyzed.push({ ...meta, takenAt: analysis.takenAt, metrics: analysis.metrics });
+      }
+
+      setStatus({ phase: "working", label: "Choosing", done: files.length, total: files.length });
+      const selection = selectBestPhotos(analyzed);
+
+      await saveSession({
+        sessionId,
+        createdAt: Date.now(),
+        photos,
+        selectedIds: selection.selected.map((photo) => photo.id),
+        scores: selection.ranked.map(({ id, score, breakdown, rejectedFor }) => ({
+          id,
+          score,
+          breakdown,
+          rejectedFor,
+        })),
+        duplicateGroups: selection.duplicateGroups.map((group) => ({
+          bestId: group.best.id,
+          alternateIds: group.alternates.map((photo) => photo.id),
+        })),
+        rejectedCount: selection.rejectedCount,
+        unanalyzedIds,
+      });
 
       router.push(`/review?session=${sessionId}`);
     } catch (error) {
@@ -128,8 +170,8 @@ export default function PhotoUploader() {
       )}
 
       <p className="muted small">
-        Pick 20–30 photos for now. On iPhone, tap “Choose photos” → Photo Library, then
-        select and tap Add.
+        On iPhone, tap “Choose photos” → Photo Library, then select and tap Add. Photos
+        are analyzed on your device — nothing is uploaded.
       </p>
     </div>
   );
