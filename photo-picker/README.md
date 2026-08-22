@@ -301,6 +301,22 @@ binaries do not belong in a git repository. To self-host, serve them and set
 If either fetch fails the app still works: photos without embeddings fall back
 to colour, layout and time, which is covered by a test.
 
+## Storage
+
+Only the newest batch is kept, and within it only the photos that can still be
+displayed: the pool steering re-chooses from, whatever is currently shown, and
+anything that could not be scored.
+
+This is deliberate rather than tidy-mindedness. Photos are stored as their
+original files, so a 50-photo batch off an iPhone is 150 MB or more. Keeping
+previous batches meant every upload added another copy of that; keeping every
+photo meant storing full-size originals for photos the user would never see.
+Once an origin's storage is exhausted, writes fail — and on iOS the symptom is
+not an error message but the photo picker refusing to close when you tap Add,
+because the newly picked files cannot be staged.
+
+If a save still fails for space, storage is cleared and the save retried once.
+
 ## Steering
 
 Tapping **♥** keeps a photo and makes similar ones cheaper to include; **✕**
