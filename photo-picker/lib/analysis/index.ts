@@ -1,0 +1,169 @@
+/**
+ * Orchestration: take the picked files, hand back metrics for each.
+ *
+ * Uses a small pool of workers when the browser allows it, and falls back to
+ * decoding on the main thread when it doesn't (or when starting a worker
+ * fails, which bundlers and strict CSPs both manage to cause).
+ */
+
+import { canDecodeHere, decodeToPixels, ANALYSIS_SIZE } from "./decode";
+import { readCaptureTime } from "./exif";
+import { computeMetrics, type ImageMetrics } from "./metrics";
+import type { WorkerRequest, WorkerResponse } from "./worker";
+
+export type AnalysisInput = { id: string; file: File };
+
+export type AnalysisResult = {
+  id: string;
+  metrics: ImageMetrics | null;
+  takenAt: number | null;
+  error?: string;
+};
+
+export type ProgressHandler = (done: number, total: number) => void;
+
+/** Workers are a win up to a point; beyond it they just contend for memory. */
+const MAX_WORKERS = 4;
+
+function workerCount(taskCount: number): number {
+  const cores =
+    typeof navigator !== "undefined" && navigator.hardwareConcurrency
+      ? navigator.hardwareConcurrency
+      : 2;
+  return Math.max(1, Math.min(MAX_WORKERS, cores - 1, taskCount));
+}
+
+function createWorker(): Worker | null {
+  try {
+    return new Worker(new URL("./worker.ts", import.meta.url));
+  } catch {
+    return null;
+  }
+}
+
+export async function analyzePhotos(
+  inputs: AnalysisInput[],
+  onProgress?: ProgressHandler,
+): Promise<AnalysisResult[]> {
+  if (inputs.length === 0) return [];
+
+  // Capture times come from the file header, independent of pixel decoding.
+  const captureTimes = new Map<string, number | null>();
+  await Promise.all(
+    inputs.map(async ({ id, file }) => captureTimes.set(id, await readCaptureTime(file))),
+  );
+
+  const metrics = await computeAllMetrics(inputs, onProgress);
+
+  return inputs.map(({ id }) => {
+    const result = metrics.get(id);
+    return {
+      id,
+      metrics: result?.metrics ?? null,
+      takenAt: captureTimes.get(id) ?? null,
+      error: result?.error,
+    };
+  });
+}
+
+type MetricsResult = { metrics: ImageMetrics | null; error?: string };
+
+async function computeAllMetrics(
+  inputs: AnalysisInput[],
+  onProgress?: ProgressHandler,
+): Promise<Map<string, MetricsResult>> {
+  const results = new Map<string, MetricsResult>();
+  let done = 0;
+
+  const report = () => onProgress?.(done, inputs.length);
+  report();
+
+  const workers = Array.from({ length: workerCount(inputs.length) }, createWorker).filter(
+    (worker): worker is Worker => worker !== null,
+  );
+
+  // No workers available — decode on the main thread. Slower and it blocks,
+  // but it is the difference between a working app and a broken one.
+  if (workers.length === 0) {
+    for (const { id, file } of inputs) {
+      results.set(id, await analyzeOnMainThread(file));
+      done++;
+      report();
+    }
+    return results;
+  }
+
+  try {
+    const queue = [...inputs];
+    await Promise.all(
+      workers.map(async (worker) => {
+        for (;;) {
+          const next = queue.shift();
+          if (!next) return;
+
+          const result = await runInWorker(worker, next);
+          // A worker that cannot decode (no OffscreenCanvas, say) should not
+          // take the whole batch down with it.
+          results.set(
+            next.id,
+            result.metrics ? result : await analyzeOnMainThread(next.file),
+          );
+          done++;
+          report();
+        }
+      }),
+    );
+  } finally {
+    for (const worker of workers) worker.terminate();
+  }
+
+  return results;
+}
+
+function runInWorker(worker: Worker, input: AnalysisInput): Promise<MetricsResult> {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+    };
+
+    const onMessage = (event: MessageEvent<WorkerResponse>) => {
+      if (event.data.id !== input.id) return;
+      cleanup();
+      resolve(
+        event.data.ok
+          ? { metrics: event.data.metrics }
+          : { metrics: null, error: event.data.error },
+      );
+    };
+
+    const onError = () => {
+      cleanup();
+      resolve({ metrics: null, error: "Worker failed" });
+    };
+
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+
+    const request: WorkerRequest = {
+      id: input.id,
+      blob: input.file,
+      maxSize: ANALYSIS_SIZE,
+    };
+    worker.postMessage(request);
+  });
+}
+
+async function analyzeOnMainThread(file: File): Promise<MetricsResult> {
+  if (!canDecodeHere()) {
+    return { metrics: null, error: "This browser cannot decode images for analysis" };
+  }
+  try {
+    return { metrics: computeMetrics(await decodeToPixels(file)) };
+  } catch (error) {
+    return {
+      metrics: null,
+      error: error instanceof Error ? error.message : "Analysis failed",
+    };
+  }
+}

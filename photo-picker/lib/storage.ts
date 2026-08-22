@@ -12,7 +12,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { PhotoMeta, ScoredPhoto } from "./scoring";
+import type { PhotoMeta } from "./scoring";
 
 const ROOT = path.join(tmpdir(), "photo-picker-uploads");
 
@@ -23,9 +23,16 @@ export type SessionData = {
   sessionId: string;
   createdAt: string;
   photos: PhotoMeta[];
-  /** Populated once the upload is finalized and scoring has run. */
-  selected: ScoredPhoto[] | null;
+  /** Set once the client says the upload is complete. */
+  finalized: boolean;
 };
+
+/**
+ * Scoring is not done here. It needs the decoded pixels, and those live in the
+ * browser — see `lib/analysis/`. This module is the storage half of the
+ * server-side upload path, kept working behind NEXT_PUBLIC_UPLOAD_TO_SERVER
+ * for when scoring moves server-side.
+ */
 
 function assertSafeId(id: string): string {
   if (!SAFE_ID.test(id)) throw new Error(`Invalid id: ${id}`);
@@ -74,7 +81,7 @@ export async function appendPhotos(
     sessionId,
     createdAt: new Date().toISOString(),
     photos: [],
-    selected: null,
+    finalized: false,
   };
 
   for (const file of files) {
@@ -89,19 +96,14 @@ export async function appendPhotos(
     });
   }
 
-  // New photos invalidate any previous selection.
-  session.selected = null;
   await writeSession(session);
   return session;
 }
 
-export async function setSelection(
-  sessionId: string,
-  selected: ScoredPhoto[],
-): Promise<SessionData> {
+export async function finalizeSession(sessionId: string): Promise<SessionData> {
   const session = await readSession(sessionId);
   if (!session) throw new Error(`Unknown session: ${sessionId}`);
-  session.selected = selected;
+  session.finalized = true;
   await writeSession(session);
   return session;
 }
