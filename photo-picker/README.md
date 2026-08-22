@@ -166,6 +166,30 @@ If a large batch still feels slow, the next lever is perceived rather than
 actual speed: go to the review screen immediately and fill photos in as they
 finish, instead of waiting behind a progress bar.
 
+### The pause before any of this runs
+
+On iPhone, the longest wait is not ours. Between tapping Add in the photo
+picker and the picker closing, Safari transcodes every selected photo from HEIC
+to JPEG, with no progress indication — so it looks like nothing is happening,
+and it scales with how many photos were picked.
+
+There is no way to prevent this from the page: setting `accept` does not stop
+it, and Apple has documented no way to influence the picker's format choice
+([Apple Developer Forums](https://developer.apple.com/forums/thread/743037)).
+The only workarounds are on the device:
+
+- In the picker, tap **Options** and set **Format** to **Current**, which hands
+  over the original HEIC without converting it.
+- Turn off **Settings → Photos → Optimize iPhone Storage**, or make sure the
+  photos are already downloaded — otherwise iOS fetches originals from iCloud
+  before it can hand them over.
+- Pick fewer photos at a time.
+
+If HEIC files do come through, Safari decodes them natively, but `lib/analysis/
+exif.ts` only reads capture time from JPEG, so burst detection loses its
+timestamps and falls back to the stricter hash-only rule. Photos that cannot be
+decoded at all are still shown rather than silently dropped.
+
 Everything measured is *technical* quality — `lib/analysis/metrics.ts` is pure
 functions over raw pixels, so it is unit-testable without a browser:
 

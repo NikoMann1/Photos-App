@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { selectBestPhotos, type AnalyzedPhoto } from "@/lib/scoring";
+import { selectBestPhotos, selectionSize, type AnalyzedPhoto } from "@/lib/scoring";
 import { analyzePhotos } from "@/lib/analysis";
 import { isStorageAvailable, saveSession, type StoredPhoto } from "@/lib/browser-session";
 
@@ -92,12 +92,22 @@ export default function PhotoUploader() {
 
       setStatus({ phase: "working", label: "Choosing", done: files.length, total: files.length });
       const selection = selectBestPhotos(analyzed);
+      const selectedIds = selection.selected.map((photo) => photo.id);
+
+      // If little or nothing could be analyzed — an image format this browser
+      // cannot decode, say — showing an empty review screen would be the worst
+      // possible answer. Fall back to unscored photos so the user still gets
+      // their batch; the review screen reports how many were never scored.
+      const wanted = selectionSize(photos.length);
+      if (selectedIds.length < wanted && unanalyzedIds.length > 0) {
+        selectedIds.push(...unanalyzedIds.slice(0, wanted - selectedIds.length));
+      }
 
       await saveSession({
         sessionId,
         createdAt: Date.now(),
         photos,
-        selectedIds: selection.selected.map((photo) => photo.id),
+        selectedIds,
         scores: selection.ranked.map(({ id, score, breakdown, rejectedFor }) => ({
           id,
           score,
@@ -173,6 +183,28 @@ export default function PhotoUploader() {
         On iPhone, tap “Choose photos” → Photo Library, then select and tap Add. Photos
         are analyzed on your device — nothing is uploaded.
       </p>
+
+      {!working && (
+        <details className="card">
+          <summary className="small">Why is there a long pause after I tap Add?</summary>
+          <div className="stack tight">
+            <p className="muted small">
+              That pause is iOS, not this app. Safari converts every photo you picked
+              from HEIC to JPEG before handing them over, and shows nothing while it
+              works. The more photos, the longer the wait.
+            </p>
+            <p className="muted small">
+              To skip the conversion: in the photo picker tap <strong>Options</strong> at
+              the top, then set <strong>Format</strong> to <strong>Current</strong>.
+            </p>
+            <p className="muted small">
+              Also check <strong>Settings → Photos</strong>. If “Optimize iPhone Storage”
+              is on, photos that aren’t on the device have to be downloaded from iCloud
+              first — slow on cellular.
+            </p>
+          </div>
+        </details>
+      )}
     </div>
   );
 }
