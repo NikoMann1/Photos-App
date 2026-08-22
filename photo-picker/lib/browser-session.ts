@@ -19,8 +19,15 @@ const DB_NAME = "photo-picker";
 const DB_VERSION = 1;
 const STORE = "sessions";
 
-/** Sessions older than this are cleaned up on the next save. */
-const MAX_AGE_MS = 60 * 60 * 1000;
+/**
+ * Only the newest batch is kept.
+ *
+ * Photos are stored as their original files, so a 50-photo batch off an iPhone
+ * is 150 MB or more. Keeping previous batches around meant every upload added
+ * another copy of that to the origin's storage — and once the quota is gone,
+ * writes fail and iOS can no longer stage newly picked photos, which looks
+ * like the photo picker refusing to close.
+ */
 
 export type StoredPhoto = PhotoMeta & { file: File };
 
@@ -40,7 +47,15 @@ export type StoredDuplicateGroup = { bestId: string; alternateIds: string[] };
 export type BrowserSession = {
   sessionId: string;
   createdAt: number;
+  /**
+   * Only the photos that can ever be displayed: the pool steering draws from,
+   * plus anything currently shown. Photos that lost to a duplicate or failed
+   * the quality bar are counted but not kept — storing every original file was
+   * the bulk of the space, for photos the user will never see.
+   */
   photos: StoredPhoto[];
+  /** How many photos were in the batch, including ones not kept above. */
+  totalPhotos: number;
   /** Ids of the photos currently shown, after any steering. */
   selectedIds: string[];
   /** Every photo's score, best-first. */
@@ -102,8 +117,55 @@ export async function saveSession(session: BrowserSession): Promise<void> {
   } finally {
     db.close();
   }
-  // Best effort: a stale batch of 30 photos is a lot of quota to leave behind.
-  void pruneOldSessions(session.sessionId);
+}
+
+/**
+ * Saves a batch, dropping every earlier one first so storage holds one batch
+ * at a time. If the write still fails for space, clear everything and try once
+ * more before giving up — a full store is recoverable, and the alternative is
+ * an app that silently stops accepting photos.
+ */
+export async function saveLatestSession(session: BrowserSession): Promise<void> {
+  await deleteOtherSessions(session.sessionId);
+
+  try {
+    await saveSession(session);
+  } catch (error) {
+    if (!isQuotaError(error)) throw error;
+    await deleteOtherSessions(null);
+    await saveSession(session);
+  }
+}
+
+function isQuotaError(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === "QuotaExceededError" || error.name === "NotEnoughSpaceError")
+  );
+}
+
+/** Removes every stored batch except `keepId`; pass null to remove all. */
+export async function deleteOtherSessions(keepId: string | null): Promise<void> {
+  try {
+    const db = await openDb();
+    try {
+      const tx = db.transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      const keys = await promisify<IDBValidKey[]>(store.getAllKeys());
+      for (const key of keys) {
+        if (key !== keepId) store.delete(key);
+      }
+      await new Promise<void>((resolve) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Never fail an upload because cleanup could not run.
+  }
 }
 
 export async function loadSession(sessionId: string): Promise<BrowserSession | null> {
@@ -116,27 +178,6 @@ export async function loadSession(sessionId: string): Promise<BrowserSession | n
     return result ?? null;
   } finally {
     db.close();
-  }
-}
-
-async function pruneOldSessions(keepId: string): Promise<void> {
-  try {
-    const db = await openDb();
-    try {
-      const tx = db.transaction(STORE, "readwrite");
-      const store = tx.objectStore(STORE);
-      const all = await promisify<BrowserSession[]>(store.getAll());
-      const cutoff = Date.now() - MAX_AGE_MS;
-      for (const session of all) {
-        if (session.sessionId !== keepId && session.createdAt < cutoff) {
-          store.delete(session.sessionId);
-        }
-      }
-    } finally {
-      db.close();
-    }
-  } catch {
-    // Cleanup is never worth failing an upload over.
   }
 }
 

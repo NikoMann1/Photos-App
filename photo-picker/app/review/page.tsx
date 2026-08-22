@@ -89,7 +89,7 @@ function Review() {
           scored: session.scores,
           pool: pool.length > 0 ? pool : session.scores,
           summary: {
-            total: session.photos.length,
+            total: session.totalPhotos ?? session.photos.length,
             rejectedCount: session.rejectedCount,
             burstCount: session.duplicateGroups.length,
             collapsedCount: session.duplicateGroups.reduce(

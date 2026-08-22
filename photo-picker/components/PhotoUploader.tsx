@@ -10,7 +10,7 @@ import {
   type AnalyzedPhoto,
 } from "@/lib/scoring";
 import { analyzePhotos, embedPhotos } from "@/lib/analysis";
-import { isStorageAvailable, saveSession, type StoredPhoto } from "@/lib/browser-session";
+import { isStorageAvailable, saveLatestSession, type StoredPhoto } from "@/lib/browser-session";
 
 /**
  * Photos per POST when the server round trip is enabled. Small batches keep any
@@ -132,6 +132,15 @@ export default function PhotoUploader() {
 
       const selectedIds = selection.selected.map((photo) => photo.id);
 
+      const collapsed = new Set(
+        selection.duplicateGroups.flatMap((group) =>
+          group.alternates.map((alternate) => alternate.id),
+        ),
+      );
+      const representativeIds = selection.ranked
+        .map((photo) => photo.id)
+        .filter((id) => !collapsed.has(id));
+
       // If little or nothing could be analyzed — an image format this browser
       // cannot decode, say — showing an empty review screen would be the worst
       // possible answer. Fall back to unscored photos so the user still gets
@@ -141,23 +150,20 @@ export default function PhotoUploader() {
         selectedIds.push(...unanalyzedIds.slice(0, wanted - selectedIds.length));
       }
 
-      await saveSession({
+      // Keep the originals only for photos that can still appear: the pool
+      // steering re-chooses from, whatever is currently shown, and anything
+      // that could not be scored. The rest are counted, not stored — full-size
+      // files for photos the user will never see were the bulk of the space.
+      const keep = new Set([...representativeIds, ...selectedIds, ...unanalyzedIds]);
+
+      await saveLatestSession({
         sessionId,
         createdAt: Date.now(),
-        photos,
+        photos: photos.filter((photo) => keep.has(photo.id)),
+        totalPhotos: photos.length,
         selectedIds,
         scores: selection.ranked.map((photo) => ({ ...photo, takenAt: photo.takenAt ?? null })),
-        representativeIds: [
-          ...selection.duplicateGroups.map((group) => group.best.id),
-          ...selection.ranked
-            .filter(
-              (photo) =>
-                !selection.duplicateGroups.some((group) =>
-                  group.alternates.some((alternate) => alternate.id === photo.id),
-                ),
-            )
-            .map((photo) => photo.id),
-        ].filter((id, index, all) => all.indexOf(id) === index),
+        representativeIds,
         steering: NO_STEERING,
         duplicateGroups: selection.duplicateGroups.map((group) => ({
           bestId: group.best.id,
