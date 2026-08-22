@@ -201,3 +201,14 @@ h2 {
   cursor: pointer;
   touch-action: manipulation;
 }
+
+details.card summary {
+  cursor: pointer;
+  color: var(--accent);
+  /* The default marker sits oddly against the card padding. */
+  list-style-position: inside;
+}
+
+details.card[open] summary {
+  margin-bottom: 12px;
+}

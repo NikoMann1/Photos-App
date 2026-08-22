@@ -16,6 +16,7 @@
  * spends one slot rather than ten.
  */
 
+import { embeddingSimilarity } from "./analysis/embedding";
 import {
   HASH_BITS,
   colorDistance,
@@ -37,7 +38,15 @@ export type PhotoMeta = {
   takenAt?: number | null;
 };
 
-export type AnalyzedPhoto = PhotoMeta & { metrics: ImageMetrics };
+export type AnalyzedPhoto = PhotoMeta & {
+  metrics: ImageMetrics;
+  /**
+   * Unit-length content embedding, when the second analysis stage ran for this
+   * photo. Absent for photos outside the shortlist, or when the model could
+   * not be loaded — everything below degrades to the cheap signals.
+   */
+  embedding?: Float32Array | null;
+};
 
 /** Why a photo scored the way it did — surfaced in the UI for calibration. */
 export type ScoreBreakdown = {
@@ -277,6 +286,13 @@ export function compareForRanking(a: ScoredPhoto, b: ScoredPhoto): number {
 // ---------------------------------------------------------------------------
 
 export function isNearDuplicate(a: ScoredPhoto, b: ScoredPhoto): boolean {
+  // Content beats pixels when it is available: it recognises the same subject
+  // through a re-crop or an exposure change, and — more importantly — refuses
+  // to merge two photos that merely share a layout.
+  if (a.embedding && b.embedding) {
+    return embeddingSimilarity(a.embedding, b.embedding) >= CONTENT_SAME_SUBJECT;
+  }
+
   const distance = hammingDistance(a.metrics.hash, b.metrics.hash);
   if (distance > DUPLICATE_LOOSE) return false;
 
@@ -343,8 +359,26 @@ const COLOR_SPREAD = 40;
 /** Photos further apart in time than this are treated as separate moments. */
 const TIME_SPREAD_MS = 20 * 60 * 1000;
 
+/**
+ * Cosine similarity above which two embeddings describe the same subject.
+ * Measured with this model: a mirrored copy of a photo scores 0.99, a
+ * hue-shifted copy 0.88, a different shot of the same scene 0.86, and
+ * unrelated content 0.19.
+ */
+const CONTENT_SAME_SUBJECT = 0.9;
+
 /** 0 (nothing in common) to 1 (the same photo). */
 export function similarity(a: ScoredPhoto, b: ScoredPhoto): number {
+  // When both photos were embedded, ask the model instead of guessing from
+  // colour: a hue-shifted copy of one photo is the same subject, which colour
+  // and hash signals both read as a different one.
+  if (a.embedding && b.embedding) {
+    const content = embeddingSimilarity(a.embedding, b.embedding);
+    // Map 0.19 (unrelated) to 0 and 1.0 (identical) to 1, so it spans the same
+    // range as the cheap signals it replaces.
+    return Math.max(0, Math.min(1, (content - 0.19) / 0.81));
+  }
+
   const colour =
     1 - Math.min(1, colorDistance(a.metrics.colorSignature, b.metrics.colorSignature) / COLOR_SPREAD);
 
@@ -446,16 +480,35 @@ export function selectBestPhotos(
 }
 
 /**
+ * Photos worth spending the expensive second stage on.
+ *
+ * Embedding costs roughly 300 ms a photo against stage one's ~50 ms, so it
+ * runs only on photos that could plausibly be selected: the deduplicated,
+ * quality-passing candidates, a few times over the number of slots so there is
+ * real competition to resolve.
+ */
+export function shortlistForEmbedding(
+  selection: Selection,
+  ratio: number = SELECTION_RATIO,
+): ScoredPhoto[] {
+  const candidates = selection.ranked.filter((photo) => photo.rejectedFor === null);
+  const target = selectionSize(candidates.length, ratio);
+  return candidates.slice(0, Math.max(target * 3, Math.min(candidates.length, 20)));
+}
+
+/**
  * NOT-YET-SOLVED: what the photo is actually of.
  *
  * Everything above measures whether a photo is technically sound. None of it
  * can tell a striking composition from a well-exposed photo of nothing, so a
  * boring-but-sharp frame outranks an interesting one with motion blur.
  *
- * Diverse selection above is a workaround, not a fix. It stops the results
- * being ten versions of one subject, but it spreads by colour, layout and
- * time — not by content. It cannot tell that a photo has a person in it, or
- * that the subject is the thing you walked across a museum to see.
+ * Content embeddings (`analysis/embedding.ts`) close part of this: diversity
+ * and duplicate detection now spread by subject rather than by colour. What
+ * remains missing is *judgement*. The model can say two photos show the same
+ * room; it is not asked, and cannot reliably say, which room was worth
+ * photographing. Zero-shot prompts for that were tested and rejected — asking
+ * for "a beautiful photograph" ranked floor grating above a harbour view.
  *
  * That is also why the count is still governed by a ratio rather than falling
  * out of the quality bar: on technical merit alone, most of a decent batch

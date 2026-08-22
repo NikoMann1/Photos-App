@@ -2,8 +2,13 @@
 
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { selectBestPhotos, type AnalyzedPhoto } from "@/lib/scoring";
-import { analyzePhotos } from "@/lib/analysis";
+import {
+  selectBestPhotos,
+  selectionSize,
+  shortlistForEmbedding,
+  type AnalyzedPhoto,
+} from "@/lib/scoring";
+import { analyzePhotos, embedPhotos } from "@/lib/analysis";
 import { isStorageAvailable, saveSession, type StoredPhoto } from "@/lib/browser-session";
 
 /**
@@ -30,6 +35,7 @@ type Status =
 
 /** Analysis is the slow step, so it gets its own progress rather than a spinner. */
 const ANALYZING = "Analyzing";
+const LOOKING = "Looking at";
 
 export default function PhotoUploader() {
   const router = useRouter();
@@ -91,13 +97,54 @@ export default function PhotoUploader() {
       }
 
       setStatus({ phase: "working", label: "Choosing", done: files.length, total: files.length });
-      const selection = selectBestPhotos(analyzed);
+      let selection = selectBestPhotos(analyzed);
+
+      // Second stage: work out what the shortlisted photos are actually *of*,
+      // then choose again. Only the shortlist, because this costs roughly six
+      // times what stage one does per photo. Failures here are not fatal — the
+      // first selection already stands, and photos without an embedding fall
+      // back to the cheap similarity signals.
+      const shortlist = shortlistForEmbedding(selection);
+      if (shortlist.length > 1) {
+        const byId = new Map(photos.map((photo) => [photo.id, photo.file]));
+        const embeddings = await embedPhotos(
+          shortlist
+            .map((photo) => ({ id: photo.id, file: byId.get(photo.id) }))
+            .filter((input): input is { id: string; file: File } => input.file !== undefined),
+          (done, total) => setStatus({ phase: "working", label: LOOKING, done, total }),
+        );
+
+        const found = new Map(
+          embeddings
+            .filter((result) => result.embedding !== null)
+            .map((result) => [result.id, result.embedding]),
+        );
+
+        if (found.size > 1) {
+          selection = selectBestPhotos(
+            analyzed.map((photo) =>
+              found.has(photo.id) ? { ...photo, embedding: found.get(photo.id) } : photo,
+            ),
+          );
+        }
+      }
+
+      const selectedIds = selection.selected.map((photo) => photo.id);
+
+      // If little or nothing could be analyzed — an image format this browser
+      // cannot decode, say — showing an empty review screen would be the worst
+      // possible answer. Fall back to unscored photos so the user still gets
+      // their batch; the review screen reports how many were never scored.
+      const wanted = selectionSize(photos.length);
+      if (selectedIds.length < wanted && unanalyzedIds.length > 0) {
+        selectedIds.push(...unanalyzedIds.slice(0, wanted - selectedIds.length));
+      }
 
       await saveSession({
         sessionId,
         createdAt: Date.now(),
         photos,
-        selectedIds: selection.selected.map((photo) => photo.id),
+        selectedIds,
         scores: selection.ranked.map(({ id, score, breakdown, rejectedFor }) => ({
           id,
           score,
@@ -173,6 +220,28 @@ export default function PhotoUploader() {
         On iPhone, tap “Choose photos” → Photo Library, then select and tap Add. Photos
         are analyzed on your device — nothing is uploaded.
       </p>
+
+      {!working && (
+        <details className="card">
+          <summary className="small">Why is there a long pause after I tap Add?</summary>
+          <div className="stack tight">
+            <p className="muted small">
+              That pause is iOS, not this app. Safari converts every photo you picked
+              from HEIC to JPEG before handing them over, and shows nothing while it
+              works. The more photos, the longer the wait.
+            </p>
+            <p className="muted small">
+              To skip the conversion: in the photo picker tap <strong>Options</strong> at
+              the top, then set <strong>Format</strong> to <strong>Current</strong>.
+            </p>
+            <p className="muted small">
+              Also check <strong>Settings → Photos</strong>. If “Optimize iPhone Storage”
+              is on, photos that aren’t on the device have to be downloaded from iCloud
+              first — slow on cellular.
+            </p>
+          </div>
+        </details>
+      )}
     </div>
   );
 }
