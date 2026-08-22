@@ -17,7 +17,8 @@ export default function UploadPage() {
         <h2>Milestone 1</h2>
         <p className="muted small">
           Selection is a placeholder — a random ~10% of what you upload. The point of
-          this build is to prove the save-to-Photos path on a real iPhone.
+          this build is to prove the save-to-Photos path on a real iPhone. Your photos
+          stay on this device; nothing is uploaded.
         </p>
       </section>
     </div>

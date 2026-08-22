@@ -16,11 +16,12 @@ photo-picker/
 │   ├── page.tsx                              # Upload screen
 │   ├── review/page.tsx                       # "Best" photos + save button
 │   └── api/
-│       ├── upload/route.ts                   # Receives photos, runs scoring
+│       ├── upload/route.ts                   # Receives photos, stores + scores
 │       └── photos/[sessionId]/[photoId]/     # Serves a stored photo back
 ├── lib/
 │   ├── scoring.ts                            # PLACEHOLDER selection logic
-│   └── storage.ts                            # Temp per-session file storage
+│   ├── browser-session.ts                    # Photos held in the browser
+│   └── storage.ts                            # Temp server-side file storage
 ├── components/
 │   ├── PhotoUploader.tsx
 │   ├── PhotoGrid.tsx
@@ -28,9 +29,31 @@ photo-picker/
 └── scripts/lan-ip.mjs                        # Prints this Mac's wifi IP
 ```
 
-Two files beyond the original sketch, both load-bearing: `lib/storage.ts` (the
-upload route needs somewhere to put bytes) and the `api/photos/...` route (the
-review grid and the share need to read those bytes back).
+## Where the photos live
+
+**The photos stay in the browser.** The file picker's `File` objects go into
+IndexedDB, the review grid renders them from object URLs, and the share hands
+those very same `File` objects to `navigator.share`. Nothing has to reach a
+server for save-to-Photos to work.
+
+That's not just convenient — it's the more reliable design for this milestone.
+Safari requires `navigator.share()` to be called while the user gesture is still
+live, so any `await` before it (like fetching image bytes back from a server)
+risks a `NotAllowedError`. With the files already in hand the click handler is
+fully synchronous, which is the safest shape available on iOS. It also means the
+app deploys anywhere, including serverless hosts with no persistent filesystem.
+
+The server upload path still exists and still works — `POST /api/upload` stores
+photos in a per-session temp directory with a `meta.json` alongside, and
+`/api/photos/...` serves them back. It's off by default because it needs a
+long-running server with a real disk. Turn it on to exercise it locally:
+
+```bash
+NEXT_PUBLIC_UPLOAD_TO_SERVER=1 npm run dev
+```
+
+Milestone 2 decides whether real scoring runs on the server (which needs the
+pixels up there) or in the browser via WASM. This keeps both doors open.
 
 ## Run it
 
@@ -39,9 +62,12 @@ npm install
 npm run dev          # http://localhost:3000
 ```
 
-Uploads land in a per-session directory under the OS temp dir, with a
-`meta.json` next to them. Nothing is kept in process memory, so the dev server
-can hot-reload mid-session. Nothing is cleaned up either — the OS reaps it.
+## Deploy it (test from a phone, no computer needed)
+
+The app is a standard Next.js project in a subdirectory, so any Next host works.
+On Vercel, the one setting that matters is **Root Directory → `photo-picker`**;
+the framework preset and build commands auto-detect. Any HTTPS deployment gives
+you a secure context, which is all the share sheet needs.
 
 ## Test on your iPhone
 
@@ -119,30 +145,32 @@ enables when they're in hand. That's deliberate — see below.
 
 ## Notes for the next milestone
 
-- **Why the files are prefetched.** Safari requires `navigator.share()` to be
-  called while the user gesture is still live. Awaiting `fetch` inside the click
-  handler consumes that activation and the call fails with `NotAllowedError`.
-  So `SaveToPhotosButton` fetches the `File` objects on mount and the click
-  handler calls `share()` synchronously. Keep that shape when the real scoring
-  lands — it's the single easiest thing to break here.
+- **Keep the share call synchronous.** Safari requires `navigator.share()` to
+  be called while the user gesture is still live; an `await` before it consumes
+  that activation and the call fails with `NotAllowedError`. `SaveToPhotosButton`
+  has zero async before `share()`. If real scoring ever moves the photos back
+  behind a server round trip, prefetch the `File` objects on mount rather than
+  fetching them in the click handler — this is the single easiest thing here to
+  break.
 - **`allowedDevOrigins`.** Next's dev server 403s `/_next/*` requests from
   non-allowlisted hosts. Loading from the phone is exactly that: the HTML
   arrives, every JS chunk 403s, and the page never hydrates — the file picker
   just does nothing. `next.config.ts` allowlists private IP ranges, `*.local`,
   this machine's detected addresses, and the tunnel hostnames.
-- **Uploads are batched** 5 files per POST, sequentially. A 30-photo batch off a
-  phone is a few hundred MB in one request otherwise, and batching gives real
-  progress. The server appends to `meta.json` without a lock, so those requests
-  must not be parallelized.
+- **Server uploads are batched** 5 files per POST, sequentially (when the flag
+  above is on). A 30-photo batch off a phone is a few hundred MB in one request
+  otherwise, and batching gives real progress. The server appends to `meta.json`
+  without a lock, so those requests must not be parallelized.
 - **Replacing the scorer**: `selectBestPhotos(photos)` in `lib/scoring.ts` is
   the only thing the API route calls. Per-photo scoring and selection are split
   so blur/duplicate/aesthetic work can slot into `scorePhoto` without touching
   the route or the UI. It currently runs on the metadata only — real scoring
   will need the pixels, so expect it to become async and read from
   `lib/storage.ts`.
-- **Not done yet**: no session cleanup, no HEIC handling (Safari usually
-  transcodes to JPEG on upload, but not always), no auth, no upload resume, and
-  500-photo batches are untested — 20–30 is the tested range.
+- **Not done yet**: no HEIC handling (Safari usually transcodes to JPEG when
+  picking, but not always), no auth, and 500-photo batches are untested — 20–30
+  is the tested range. Browser storage prunes sessions older than an hour;
+  server-side temp directories are left for the OS to reap.
 
 ## Troubleshooting
 
@@ -155,5 +183,6 @@ enables when they're in hand. That's deliberate — see below.
   URL is `https://` (Option A or B).
 - **Safari won't load the HTTPS LAN URL.** The CA profile is installed but not
   trusted — Certificate Trust Settings, step 4 above.
-- **"That upload session has expired."** The temp directory was reaped, or the
-  server restarted onto a different temp root. Upload again.
+- **"That batch isn't in this browser's storage."** The photos live in
+  IndexedDB, so a different browser, a private window, or cleared site data all
+  lose them. Upload again in the same browser.

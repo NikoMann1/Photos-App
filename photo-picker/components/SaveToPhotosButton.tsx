@@ -1,16 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 
 export type SharePhoto = {
   id: string;
   name: string;
   type: string;
+  /** The browser's own copy of the photo, straight from the file picker. */
+  file: File;
+  /** Object URL for the same file, for the grid and the download fallback. */
   url: string;
 };
 
 type ShareState =
-  | { phase: "preparing" }
   | { phase: "ready" }
   | { phase: "sharing" }
   | { phase: "shared" }
@@ -20,54 +22,27 @@ type ShareState =
 /**
  * Save-to-Photos via the Web Share API.
  *
- * Two iOS Safari constraints drive the shape of this component:
+ * Two iOS Safari constraints shape this:
  *
  * 1. `navigator.share` only exists in a secure context. Over plain http on a
  *    LAN IP it is simply `undefined`, and we fall back to download links. Use
- *    the HTTPS dev server or a tunnel to exercise the real path.
+ *    HTTPS (a deployed URL, a tunnel, or `npm run dev:https`) for the real path.
  *
  * 2. `navigator.share()` must be called while the user gesture is still
- *    "live". Awaiting fetches inside the click handler consumes that
- *    activation and Safari rejects the call with NotAllowedError. So the File
- *    objects are fetched up front, on mount, and the click handler calls
- *    share() synchronously with files already in hand.
+ *    "live". Any `await` before it consumes that activation and Safari rejects
+ *    the call with NotAllowedError. Because the photos never left the browser,
+ *    there is nothing to fetch here: the File objects come straight from the
+ *    file picker, and the click handler calls share() with zero async. That is
+ *    the most reliable shape available on iOS — keep it that way.
  */
 export default function SaveToPhotosButton({ photos }: { photos: SharePhoto[] }) {
-  const [files, setFiles] = useState<File[]>([]);
-  const [state, setState] = useState<ShareState>({ phase: "preparing" });
-
-  useEffect(() => {
-    let cancelled = false;
-    setState({ phase: "preparing" });
-
-    (async () => {
-      try {
-        const fetched = await Promise.all(
-          photos.map(async (photo) => {
-            const response = await fetch(photo.url);
-            if (!response.ok) throw new Error(`Could not load ${photo.name}`);
-            const blob = await response.blob();
-            const type = blob.type || photo.type;
-            return new File([blob], fileNameFor(photo.name, type), { type });
-          }),
-        );
-        if (cancelled) return;
-
-        setFiles(fetched);
-        setState(canShareFiles(fetched) ? { phase: "ready" } : { phase: "unsupported" });
-      } catch (error) {
-        if (cancelled) return;
-        setState({
-          phase: "error",
-          message: error instanceof Error ? error.message : "Could not prepare photos",
-        });
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [photos]);
+  const files = useMemo(
+    () => photos.map((photo) => withSaneFileName(photo.file, photo.name, photo.type)),
+    [photos],
+  );
+  const [state, setState] = useState<ShareState>(() =>
+    canShareFiles(files) ? { phase: "ready" } : { phase: "unsupported" },
+  );
 
   // Deliberately not async: share() must run in the gesture's own task.
   function handleShare() {
@@ -90,43 +65,31 @@ export default function SaveToPhotosButton({ photos }: { photos: SharePhoto[] })
       });
   }
 
-  if (state.phase === "preparing") {
-    return (
-      <button type="button" className="button primary" disabled>
-        Preparing photos…
-      </button>
-    );
+  if (state.phase === "unsupported") {
+    return <DownloadFallback photos={photos} explainSecureContext />;
   }
-
-  const shareAvailable =
-    state.phase === "ready" || state.phase === "sharing" || state.phase === "shared";
 
   return (
     <div className="stack">
-      {shareAvailable ? (
-        <>
-          <button
-            type="button"
-            className="button primary"
-            onClick={handleShare}
-            disabled={state.phase === "sharing"}
-          >
-            {state.phase === "sharing"
-              ? "Opening share sheet…"
-              : `Save ${files.length} photo${files.length === 1 ? "" : "s"} to Photos`}
-          </button>
-          <p className="muted small">
-            Tap “Save {files.length === 1 ? "Image" : `${files.length} Images`}” in the
-            share sheet to add them to your camera roll.
-          </p>
-          {state.phase === "shared" && (
-            <p className="success" role="status">
-              Handed off to the share sheet.
-            </p>
-          )}
-        </>
-      ) : (
-        <DownloadFallback photos={photos} reason={state} />
+      <button
+        type="button"
+        className="button primary"
+        onClick={handleShare}
+        disabled={state.phase === "sharing"}
+      >
+        {state.phase === "sharing"
+          ? "Opening share sheet…"
+          : `Save ${files.length} photo${files.length === 1 ? "" : "s"} to Photos`}
+      </button>
+      <p className="muted small">
+        Tap “Save {files.length === 1 ? "Image" : `${files.length} Images`}” in the share
+        sheet to add them to your camera roll.
+      </p>
+
+      {state.phase === "shared" && (
+        <p className="success" role="status">
+          Handed off to the share sheet.
+        </p>
       )}
 
       {state.phase === "error" && (
@@ -134,7 +97,7 @@ export default function SaveToPhotosButton({ photos }: { photos: SharePhoto[] })
           <p className="error" role="alert">
             {state.message}
           </p>
-          <DownloadFallback photos={photos} reason={state} />
+          <DownloadFallback photos={photos} />
         </>
       )}
     </div>
@@ -149,20 +112,20 @@ export default function SaveToPhotosButton({ photos }: { photos: SharePhoto[] })
  */
 function DownloadFallback({
   photos,
-  reason,
+  explainSecureContext = false,
 }: {
   photos: SharePhoto[];
-  reason: ShareState;
+  explainSecureContext?: boolean;
 }) {
+  const insecure = typeof window !== "undefined" && !window.isSecureContext;
+
   return (
     <div className="stack tight">
-      {reason.phase === "unsupported" && (
+      {explainSecureContext && (
         <p className="muted small">
           Sharing files isn’t available in this browser
-          {typeof window !== "undefined" && !window.isSecureContext
-            ? " — the page is not in a secure context, so serve it over HTTPS or localhost"
-            : ""}
-          . Falling back to downloads.
+          {insecure ? " — the page isn’t in a secure context, so open it over HTTPS" : ""}.
+          Falling back to downloads.
         </p>
       )}
       <ul className="stack tight">
@@ -179,6 +142,7 @@ function DownloadFallback({
 }
 
 function canShareFiles(files: File[]): boolean {
+  if (files.length === 0) return false;
   if (typeof navigator === "undefined" || typeof navigator.share !== "function") {
     return false;
   }
@@ -191,8 +155,8 @@ function canShareFiles(files: File[]): boolean {
 }
 
 /** iOS keys off the extension when saving, so make sure there is a sane one. */
-function fileNameFor(name: string, type: string): string {
-  if (/\.[a-z0-9]{3,4}$/i.test(name)) return name;
+function withSaneFileName(file: File, name: string, type: string): File {
+  if (/\.[a-z0-9]{3,4}$/i.test(name)) return file;
   const extension = type.split("/")[1]?.replace("jpeg", "jpg") ?? "jpg";
-  return `${name || "photo"}.${extension}`;
+  return new File([file], `${name || "photo"}.${extension}`, { type: file.type || type });
 }
