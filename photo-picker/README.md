@@ -151,8 +151,20 @@ enables when they're in hand. That's deliberate — see below.
 
 ## Scoring
 
-Analysis runs in the browser, in a pool of up to four workers, on photos
-downscaled to 512px. A 19-photo batch measures in about 300 ms on a laptop.
+Analysis runs in the browser, in a worker per core, on photos downscaled to
+512px.
+
+Where the time goes, measured on 4032×3024 photos: **decode ~80 ms, canvas
+scaling ~10 ms, all the metrics ~6 ms.** JPEG decode is over 80% of it and
+there is no way around it in a browser — decoding at a target size via
+`createImageBitmap` resize options measured *slower* in Chromium (152 vs 111
+ms/photo), and canvas smoothing quality made no reliable difference. So the
+levers are parallelism and overlap, not cleverness per photo: 40 full-size
+photos take ~1.8 s here, or ~44 ms each. A phone is several times slower.
+
+If a large batch still feels slow, the next lever is perceived rather than
+actual speed: go to the review screen immediately and fill photos in as they
+finish, instead of waiting behind a progress bar.
 
 Everything measured is *technical* quality — `lib/analysis/metrics.ts` is pure
 functions over raw pixels, so it is unit-testable without a browser:
@@ -166,9 +178,19 @@ functions over raw pixels, so it is unit-testable without a browser:
 | colour | Vivid versus washed out, weighted lightly |
 | `hash` + `colorSignature` | Near-duplicates and bursts |
 
-Selection then runs in three stages: **collapse near-duplicates** (so a burst
-of ten spends one slot, not ten), **drop anything below an absolute quality
-bar**, then **rank what survives** and take the top N.
+Selection then runs in four stages: **collapse near-duplicates** (so a burst of
+ten spends one slot, not ten), **drop anything below an absolute quality bar**,
+**rank what survives**, and take N by **diverse selection** — each pick
+penalised by how much it resembles what is already picked.
+
+That last stage exists because of a real result. On a 100-photo batch from a
+phone, every surviving photo scored between **0.92 and 0.96**, nothing was
+rejected as blurry, and only 3 duplicates were found. Modern phone photos are
+essentially all technically fine, so the quality bar does nothing and ranking
+by score alone returns an arbitrary ten — several of them the same subject.
+Diversity spreads the picks by colour, layout and time, which is why
+`DIVERSITY_WEIGHT` is deliberately larger than that 0.04 score spread: when
+quality cannot separate two photos, how different they are should decide.
 
 ### Three things that bit during calibration
 
@@ -209,11 +231,19 @@ bar rejected it.
 npm test        # 18 tests, no fixtures or image libraries needed
 ```
 
-## Still not solved: aesthetic quality
+## Still not solved: what the photo is of
 
 None of this can tell a striking composition from a well-exposed photo of
 nothing. A boring-but-sharp frame outranks an interesting one with slight
 motion blur.
+
+Diverse selection is a workaround, not a fix. It stops the results being ten
+versions of one subject, but it spreads by colour, layout and time — it cannot
+tell that a photo has a person in it, or that its subject is the thing you
+walked across a museum to see. Closing that gap means a small on-device model
+producing a content embedding (MobileNet- or CLIP-style, a few MB via ONNX
+Runtime Web or TFJS), which would also give content-aware duplicate detection
+and a far better similarity measure than a pixel hash.
 
 That is also why the count is still governed by a ratio (`SELECTION_RATIO`,
 floored at 5 and capped at 50) rather than falling out of the quality bar: on
