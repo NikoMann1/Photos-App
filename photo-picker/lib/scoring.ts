@@ -27,8 +27,26 @@ export type ScoredPhoto = PhotoMeta & {
   score: number;
 };
 
-/** Fraction of uploaded photos to keep. */
+/** Fraction of uploaded photos to keep, before the floor and cap below. */
 export const SELECTION_RATIO = 0.1;
+
+/**
+ * A bare ratio assumes the fraction of good photos is constant, which is not
+ * how batches work: 20 careful shots might be mostly keepers, while 500 with
+ * burst sequences might be 5%. 10% of 20 is 2, which is too thin to judge a
+ * selection by. So clamp the count — never fewer than MIN (or the whole batch,
+ * if it is smaller), never more than MAX.
+ */
+export const MIN_SELECTION = 5;
+export const MAX_SELECTION = 50;
+
+/** How many photos to keep from a batch of `total`. */
+export function selectionSize(total: number, ratio: number = SELECTION_RATIO): number {
+  if (total <= 0) return 0;
+  const target = Math.round(total * ratio);
+  const clamped = Math.max(MIN_SELECTION, Math.min(MAX_SELECTION, target));
+  return Math.min(total, clamped);
+}
 
 /**
  * Placeholder: assigns a random score.
@@ -39,8 +57,8 @@ export function scorePhoto(photo: PhotoMeta): ScoredPhoto {
 }
 
 /**
- * Picks the top ~`ratio` of photos by score. With the placeholder scorer this
- * is just a random subset. Always returns at least one photo when given any.
+ * Picks the best photos by score — see `selectionSize` for how many. With the
+ * placeholder scorer this is just a random subset.
  *
  * The returned list preserves the input (upload) order so the review grid is
  * stable and reads chronologically.
@@ -52,7 +70,7 @@ export function selectBestPhotos(
   if (photos.length === 0) return [];
 
   const scored = photos.map(scorePhoto);
-  const keepCount = Math.max(1, Math.round(photos.length * ratio));
+  const keepCount = selectionSize(photos.length, ratio);
 
   const keepIds = new Set(
     [...scored]
