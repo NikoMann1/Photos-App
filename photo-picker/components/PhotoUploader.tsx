@@ -2,8 +2,13 @@
 
 import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { selectBestPhotos, selectionSize, type AnalyzedPhoto } from "@/lib/scoring";
-import { analyzePhotos } from "@/lib/analysis";
+import {
+  selectBestPhotos,
+  selectionSize,
+  shortlistForEmbedding,
+  type AnalyzedPhoto,
+} from "@/lib/scoring";
+import { analyzePhotos, embedPhotos } from "@/lib/analysis";
 import { isStorageAvailable, saveSession, type StoredPhoto } from "@/lib/browser-session";
 
 /**
@@ -30,6 +35,7 @@ type Status =
 
 /** Analysis is the slow step, so it gets its own progress rather than a spinner. */
 const ANALYZING = "Analyzing";
+const LOOKING = "Looking at";
 
 export default function PhotoUploader() {
   const router = useRouter();
@@ -91,7 +97,38 @@ export default function PhotoUploader() {
       }
 
       setStatus({ phase: "working", label: "Choosing", done: files.length, total: files.length });
-      const selection = selectBestPhotos(analyzed);
+      let selection = selectBestPhotos(analyzed);
+
+      // Second stage: work out what the shortlisted photos are actually *of*,
+      // then choose again. Only the shortlist, because this costs roughly six
+      // times what stage one does per photo. Failures here are not fatal — the
+      // first selection already stands, and photos without an embedding fall
+      // back to the cheap similarity signals.
+      const shortlist = shortlistForEmbedding(selection);
+      if (shortlist.length > 1) {
+        const byId = new Map(photos.map((photo) => [photo.id, photo.file]));
+        const embeddings = await embedPhotos(
+          shortlist
+            .map((photo) => ({ id: photo.id, file: byId.get(photo.id) }))
+            .filter((input): input is { id: string; file: File } => input.file !== undefined),
+          (done, total) => setStatus({ phase: "working", label: LOOKING, done, total }),
+        );
+
+        const found = new Map(
+          embeddings
+            .filter((result) => result.embedding !== null)
+            .map((result) => [result.id, result.embedding]),
+        );
+
+        if (found.size > 1) {
+          selection = selectBestPhotos(
+            analyzed.map((photo) =>
+              found.has(photo.id) ? { ...photo, embedding: found.get(photo.id) } : photo,
+            ),
+          );
+        }
+      }
+
       const selectedIds = selection.selected.map((photo) => photo.id);
 
       // If little or nothing could be analyzed — an image format this browser

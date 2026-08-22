@@ -22,6 +22,8 @@ photo-picker/
 │   ├── scoring.ts                            # Scoring, dedup, selection
 │   ├── analysis/
 │   │   ├── metrics.ts                        # Pure pixel measurements
+│   │   ├── embedding.ts                      # Content embeddings (stage two)
+│   │   ├── embed-worker.ts                   # Off-thread embedding
 │   │   ├── decode.ts                         # Photo → downscaled pixels
 │   │   ├── exif.ts                           # Capture time, for bursts
 │   │   ├── worker.ts                         # Off-main-thread analysis
@@ -255,19 +257,68 @@ bar rejected it.
 npm test        # 18 tests, no fixtures or image libraries needed
 ```
 
-## Still not solved: what the photo is of
+## Stage two: what the photo is of
+
+The measurements above cannot tell two shots of the same room apart from two
+shots of different rooms — they compare colour and layout, so a hue-shifted
+copy of one photo reads as a different subject. So a second stage runs
+MobileCLIP S0's vision tower to produce a 512-dimension embedding of what each
+photo actually shows.
+
+Measured with this model on real photos:
+
+| mirrored copy | hue-shifted | same scene, reframed | unrelated | flat colour |
+| --- | --- | --- | --- | --- |
+| 0.991 | 0.878 | 0.857 | 0.190 | 0.216 |
+
+Diversity and duplicate detection use this when it is available and fall back
+to the cheap signals when it is not.
+
+**It only runs on a shortlist.** Embedding costs ~300 ms a photo against stage
+one's ~50 ms, so it runs on the deduplicated, quality-passing contenders — a
+few times the number of slots — rather than the whole batch.
+
+### Three findings worth keeping
+
+1. **The quantized model is unusable.** `vision_model_quantized.onnx` is 11 MB
+   against fp16's 21 MB, and its output is noise: a mirrored copy of a photo
+   scored 0.349 against it while a flat blue rectangle scored 0.368. fp16
+   matches fp32 to three decimals. Do not "optimise" the download by switching.
+2. **Zero-shot aesthetics do not work.** Scoring photos against "a beautiful
+   photograph" versus "a boring snapshot" ranked floor grating above a harbour
+   view, and called the two most photographic images in the batch the most
+   boring. It was tested and dropped.
+3. **Threads do not help.** Four WASM threads measured 299 ms against 298 ms
+   for one. Parallelism comes from running several photos at once instead.
+
+### Weights and runtime
+
+Both are fetched from a CDN and cached by the browser — together ~24 MB
+gzipped on first visit, nothing after. They are not committed because ~36 MB of
+binaries do not belong in a git repository. To self-host, serve them and set
+`NEXT_PUBLIC_EMBED_MODEL_URL` and `NEXT_PUBLIC_ORT_WASM_URL`.
+
+If either fetch fails the app still works: photos without embeddings fall back
+to colour, layout and time, which is covered by a test.
+
+## Still not solved: judgement
 
 None of this can tell a striking composition from a well-exposed photo of
 nothing. A boring-but-sharp frame outranks an interesting one with slight
 motion blur.
 
-Diverse selection is a workaround, not a fix. It stops the results being ten
-versions of one subject, but it spreads by colour, layout and time — it cannot
-tell that a photo has a person in it, or that its subject is the thing you
-walked across a museum to see. Closing that gap means a small on-device model
-producing a content embedding (MobileNet- or CLIP-style, a few MB via ONNX
-Runtime Web or TFJS), which would also give content-aware duplicate detection
-and a far better similarity measure than a pixel hash.
+Stage two closed half of this gap: the app now knows when two photos show the
+same thing. What it still has no opinion about is whether that thing was worth
+photographing.
+
+Concept prompts are the obvious next step and theyhalf work. Tested against real
+photos from a museum visit, `a photo of a toilet or bathroom` and `a close-up
+photo of machinery` both identified their subject as the clear top match, and
+`a photo of beds and bunks` found all three bunk photos. But `a photo of
+people` found only the most obvious one, ranking a photo of floor grating above
+two photos that clearly contain people — at least at the crop and resolution
+tested. Worth revisiting on full-resolution photos before building ranking on
+top of it.
 
 That is also why the count is still governed by a ratio (`SELECTION_RATIO`,
 floored at 5 and capped at 50) rather than falling out of the quality bar: on

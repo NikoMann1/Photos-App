@@ -8,8 +8,18 @@ import {
   scorePhoto,
   selectBestPhotos,
   selectionSize,
+  shortlistForEmbedding,
+  similarity,
   type AnalyzedPhoto,
 } from "./scoring";
+
+/** A unit vector pointing `angle` radians from the first axis. */
+function embeddingAt(angle: number, dims = 512): Float32Array {
+  const v = new Float32Array(dims);
+  v[0] = Math.cos(angle);
+  v[1] = Math.sin(angle);
+  return v;
+}
 
 /** A well-exposed, sharp, textured photo — the baseline every case varies from. */
 function metrics(overrides: Partial<ImageMetrics> = {}): ImageMetrics {
@@ -226,4 +236,77 @@ test("selection is returned in upload order, not score order", () => {
   const result = selectBestPhotos(photos);
   const order = result.selected.map((p) => photos.findIndex((q) => q.id === p.id));
   assert.deepEqual(order, [...order].sort((a, b) => a - b));
+});
+
+test("content embeddings override the colour signals when both photos have them", () => {
+  // The case colour gets wrong: one photo and a hue-shifted copy of it. The
+  // colour signatures disagree completely; the embeddings agree.
+  const shared = embeddingAt(0);
+  const a = scorePhoto(
+    photo({ colorSignature: Array.from({ length: 32 }, () => 20) }, { embedding: shared }),
+  );
+  const b = scorePhoto(
+    photo({ colorSignature: Array.from({ length: 32 }, () => 200) }, { embedding: shared }),
+  );
+
+  assert.ok(similarity(a, b) > 0.9, "identical content should read as near-identical");
+  assert.equal(isNearDuplicate(a, b), true);
+});
+
+test("content embeddings keep different subjects apart despite matching pixels", () => {
+  // The case a hash gets wrong: same layout and colours, different subjects.
+  const flatHash = "ff".repeat(32);
+  const t = Date.parse("2026-08-20T10:00:00Z");
+  const a = scorePhoto(photo({ hash: flatHash }, { takenAt: t, embedding: embeddingAt(0) }));
+  const b = scorePhoto(
+    photo({ hash: flatHash }, { takenAt: t + 2000, embedding: embeddingAt(Math.PI / 2) }),
+  );
+
+  assert.ok(similarity(a, b) < 0.2);
+  assert.equal(
+    isNearDuplicate(a, b),
+    false,
+    "a shared layout and a shared moment must not merge different subjects",
+  );
+});
+
+test("photos without embeddings still fall back to the cheap signals", () => {
+  // The model may fail to load; the app must not depend on it.
+  const a = scorePhoto(photo({}, { embedding: null }));
+  const b = scorePhoto(photo({}, { embedding: null }));
+  assert.equal(isNearDuplicate(a, b), true, "identical metrics still merge without a model");
+
+  // 0.8, not 1: colour and structure agree completely, but with no capture
+  // times the time term contributes nothing.
+  assert.ok(similarity(a, b) > 0.75, `expected the cheap signals to agree, got ${similarity(a, b)}`);
+
+  const t = Date.parse("2026-08-20T10:00:00Z");
+  const withTimes = [
+    scorePhoto(photo({}, { embedding: null, takenAt: t })),
+    scorePhoto(photo({}, { embedding: null, takenAt: t + 1000 })),
+  ];
+  assert.ok(similarity(withTimes[0], withTimes[1]) > 0.95, "with times, all three signals agree");
+});
+
+test("the embedding shortlist covers the contenders, not the whole batch", () => {
+  const good = Array.from({ length: 40 }, (_, i) =>
+    photo(
+      { colorSignature: Array.from({ length: 32 }, () => (i * 7) % 250) },
+      { id: `ok${i}` },
+    ),
+  );
+  const blurry = Array.from({ length: 20 }, (_, i) =>
+    photo(
+      { focus: 0.001, sharpness: 2, colorSignature: Array.from({ length: 32 }, () => (i * 11) % 250) },
+      { id: `bad${i}` },
+    ),
+  );
+
+  const shortlist = shortlistForEmbedding(selectBestPhotos([...good, ...blurry]));
+  assert.ok(shortlist.length < good.length + blurry.length, "must not embed everything");
+  assert.ok(shortlist.length >= selectionSize(good.length), "must leave room to choose");
+  assert.ok(
+    shortlist.every((p) => p.rejectedFor === null),
+    "no point embedding photos the quality bar already rejected",
+  );
 });
