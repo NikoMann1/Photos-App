@@ -174,6 +174,47 @@ test("when nothing passes the bar, show the best of a bad batch rather than noth
   assert.ok(result.selected.every((p) => p.rejectedFor !== null));
 });
 
+test("selection spreads across subjects instead of stacking one of them", () => {
+  // Regression: on a real 100-photo batch every photo scored 0.92-0.96, so
+  // ranking by score alone returned several shots of the same subject.
+  // Eight near-identical photos of one scene, marginally the best-scoring,
+  // plus two of a clearly different one.
+  const sameSubject = Array.from({ length: 8 }, (_, i) =>
+    photo(
+      { colorfulness: 44, colorSignature: Array.from({ length: 32 }, () => 90) },
+      { id: `same${i}`, takenAt: Date.parse("2026-08-20T10:00:00Z") + i * 600_000 },
+    ),
+  );
+  const otherSubject = Array.from({ length: 2 }, (_, i) =>
+    photo(
+      { colorfulness: 30, colorSignature: Array.from({ length: 32 }, () => 15) },
+      { id: `other${i}`, takenAt: Date.parse("2026-08-20T14:00:00Z") + i * 600_000 },
+    ),
+  );
+
+  const result = selectBestPhotos([...sameSubject, ...otherSubject]);
+  const picked = result.selected.map((p) => p.id);
+  assert.ok(
+    picked.some((id) => id.startsWith("other")),
+    `the second subject was never picked: ${picked.join(", ")}`,
+  );
+});
+
+test("diversity never overrides a real quality gap", () => {
+  // A genuinely better photo must still win, however similar it is to the
+  // rest — diversity breaks ties, it does not outrank quality.
+  const good = photo({}, { id: "good" });
+  const mediocre = Array.from({ length: 6 }, (_, i) =>
+    photo(
+      { focus: 0.03, sharpness: 30, colorSignature: Array.from({ length: 32 }, () => 20 + i * 30) },
+      { id: `meh${i}` },
+    ),
+  );
+
+  const result = selectBestPhotos([...mediocre, good]);
+  assert.ok(result.selected.some((p) => p.id === "good"));
+});
+
 test("selection is returned in upload order, not score order", () => {
   const photos = Array.from({ length: 6 }, (_, i) =>
     photo(

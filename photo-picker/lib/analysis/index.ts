@@ -22,15 +22,22 @@ export type AnalysisResult = {
 
 export type ProgressHandler = (done: number, total: number) => void;
 
-/** Workers are a win up to a point; beyond it they just contend for memory. */
-const MAX_WORKERS = 4;
+/**
+ * Workers are a win up to a point; beyond it they contend for memory, and a
+ * 12 MP decode in flight is ~48 MB apiece — enough for iOS to kill the tab.
+ *
+ * All cores rather than cores-1: during analysis the main thread only receives
+ * messages, so holding a core back just leaves it idle. Safari reports 4 here
+ * even on phones with more, which is the real ceiling in practice.
+ */
+const MAX_WORKERS = 6;
 
 function workerCount(taskCount: number): number {
   const cores =
     typeof navigator !== "undefined" && navigator.hardwareConcurrency
       ? navigator.hardwareConcurrency
       : 2;
-  return Math.max(1, Math.min(MAX_WORKERS, cores - 1, taskCount));
+  return Math.max(1, Math.min(MAX_WORKERS, cores, taskCount));
 }
 
 function createWorker(): Worker | null {
@@ -47,12 +54,6 @@ export async function analyzePhotos(
 ): Promise<AnalysisResult[]> {
   if (inputs.length === 0) return [];
 
-  // Capture times come from the file header, independent of pixel decoding.
-  const captureTimes = new Map<string, number | null>();
-  await Promise.all(
-    inputs.map(async ({ id, file }) => captureTimes.set(id, await readCaptureTime(file))),
-  );
-
   const metrics = await computeAllMetrics(inputs, onProgress);
 
   return inputs.map(({ id }) => {
@@ -60,13 +61,17 @@ export async function analyzePhotos(
     return {
       id,
       metrics: result?.metrics ?? null,
-      takenAt: captureTimes.get(id) ?? null,
+      takenAt: result?.takenAt ?? null,
       error: result?.error,
     };
   });
 }
 
-type MetricsResult = { metrics: ImageMetrics | null; error?: string };
+type MetricsResult = {
+  metrics: ImageMetrics | null;
+  takenAt?: number | null;
+  error?: string;
+};
 
 async function computeAllMetrics(
   inputs: AnalysisInput[],
@@ -132,7 +137,7 @@ function runInWorker(worker: Worker, input: AnalysisInput): Promise<MetricsResul
       cleanup();
       resolve(
         event.data.ok
-          ? { metrics: event.data.metrics }
+          ? { metrics: event.data.metrics, takenAt: event.data.takenAt }
           : { metrics: null, error: event.data.error },
       );
     };
@@ -159,7 +164,8 @@ async function analyzeOnMainThread(file: File): Promise<MetricsResult> {
     return { metrics: null, error: "This browser cannot decode images for analysis" };
   }
   try {
-    return { metrics: computeMetrics(await decodeToPixels(file)) };
+    const takenAt = await readCaptureTime(file);
+    return { metrics: computeMetrics(await decodeToPixels(file)), takenAt };
   } catch (error) {
     return {
       metrics: null,

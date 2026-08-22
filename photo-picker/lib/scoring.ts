@@ -17,6 +17,7 @@
  */
 
 import {
+  HASH_BITS,
   colorDistance,
   hammingDistance,
   isDegenerateHash,
@@ -319,6 +320,82 @@ export function groupNearDuplicates(photos: ScoredPhoto[]): PhotoGroup[] {
 }
 
 // ---------------------------------------------------------------------------
+// Diversity
+// ---------------------------------------------------------------------------
+
+/**
+ * How much similarity to what is already chosen counts against a photo.
+ *
+ * Measured on a real 100-photo batch, every surviving photo scored between
+ * 0.92 and 0.96 — technical quality simply does not separate photos from a
+ * modern phone, so ranking by it alone returns an essentially arbitrary ten,
+ * often several of the same subject. This weight is deliberately larger than
+ * that spread: when quality cannot tell two photos apart, how different they
+ * are from what is already picked should decide.
+ *
+ * It is not a substitute for knowing what a photo is *of* — see NOT-YET-SOLVED.
+ */
+const DIVERSITY_WEIGHT = 0.15;
+
+/** Colour distance at which two photos count as completely unalike. */
+const COLOR_SPREAD = 40;
+
+/** Photos further apart in time than this are treated as separate moments. */
+const TIME_SPREAD_MS = 20 * 60 * 1000;
+
+/** 0 (nothing in common) to 1 (the same photo). */
+export function similarity(a: ScoredPhoto, b: ScoredPhoto): number {
+  const colour =
+    1 - Math.min(1, colorDistance(a.metrics.colorSignature, b.metrics.colorSignature) / COLOR_SPREAD);
+
+  // Half the bits differing is what two unrelated images average.
+  const structure =
+    1 - Math.min(1, hammingDistance(a.metrics.hash, b.metrics.hash) / (HASH_BITS / 2));
+
+  const time =
+    a.takenAt == null || b.takenAt == null
+      ? 0
+      : 1 - Math.min(1, Math.abs(a.takenAt - b.takenAt) / TIME_SPREAD_MS);
+
+  return 0.5 * colour + 0.3 * structure + 0.2 * time;
+}
+
+/**
+ * Greedy diverse selection: take the best photo, then repeatedly take whichever
+ * remaining photo has the best score once penalised by how much it resembles
+ * something already taken.
+ *
+ * The cost is O(count × pool × chosen), which for a few hundred photos and ten
+ * slots is a few thousand cheap comparisons.
+ */
+export function selectDiverse(candidates: ScoredPhoto[], count: number): ScoredPhoto[] {
+  const pool = [...candidates];
+  const chosen: ScoredPhoto[] = [];
+
+  while (chosen.length < count && pool.length > 0) {
+    let bestIndex = 0;
+    let bestValue = -Infinity;
+
+    for (let i = 0; i < pool.length; i++) {
+      let penalty = 0;
+      for (const already of chosen) {
+        penalty = Math.max(penalty, similarity(pool[i], already));
+      }
+      const value = pool[i].score - DIVERSITY_WEIGHT * penalty;
+      if (value > bestValue) {
+        bestValue = value;
+        bestIndex = i;
+      }
+    }
+
+    chosen.push(pool[bestIndex]);
+    pool.splice(bestIndex, 1);
+  }
+
+  return chosen;
+}
+
+// ---------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------
 
@@ -347,7 +424,7 @@ export function selectBestPhotos(
   // The floor exists to stop the *ratio* returning a pointlessly thin
   // selection; it is not a licence to pad with photos the quality bar just
   // rejected. If only four photos are any good, four is the honest answer.
-  const selected = candidates.slice(0, target);
+  const selected = selectDiverse(candidates, target);
 
   // Unless nothing passed at all — then show the best of a bad batch rather
   // than an empty screen. These keep their `rejectedFor`, so the UI can say why.
@@ -369,11 +446,16 @@ export function selectBestPhotos(
 }
 
 /**
- * NOT-YET-SOLVED: aesthetic quality.
+ * NOT-YET-SOLVED: what the photo is actually of.
  *
  * Everything above measures whether a photo is technically sound. None of it
  * can tell a striking composition from a well-exposed photo of nothing, so a
  * boring-but-sharp frame outranks an interesting one with motion blur.
+ *
+ * Diverse selection above is a workaround, not a fix. It stops the results
+ * being ten versions of one subject, but it spreads by colour, layout and
+ * time — not by content. It cannot tell that a photo has a person in it, or
+ * that the subject is the thing you walked across a museum to see.
  *
  * That is also why the count is still governed by a ratio rather than falling
  * out of the quality bar: on technical merit alone, most of a decent batch
