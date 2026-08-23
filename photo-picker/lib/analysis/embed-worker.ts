@@ -1,10 +1,16 @@
 /**
  * Second-stage worker: decode a photo and produce a content embedding.
  *
- * Re-decodes rather than reusing stage one's pixels. Decode costs the same
- * (~80 ms) whatever size it targets, so passing 100 pixel buffers back and
- * forth to save it would trade ~25% of this stage's time for tens of megabytes
- * held in memory — a bad trade on a phone.
+ * The blob it is handed is stage one's 512px preview, not the original photo.
+ * That matters more than it sounds: decoding a 12 MP original allocates a
+ * ~48 MB bitmap, and this stage — which already holds the model and the
+ * runtime's WASM heap — is where iOS was discarding the tab. The preview is
+ * already in memory for the grid, so reading it costs nothing new, and it is
+ * the same 512px canvas the metrics ran on, so the geometry is unchanged.
+ *
+ * Passing stage one's raw pixel buffers instead would avoid the decode
+ * entirely, but they are ~1 MB each and the shortlist is not known until every
+ * photo has been measured — so they would all have to be kept.
  */
 
 import { decodeToPixels, ANALYSIS_SIZE } from "./decode";

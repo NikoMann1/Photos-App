@@ -208,6 +208,12 @@ const MAX_EMBED_WORKERS = 1;
 
 export type EmbeddingResult = { id: string; embedding: Float32Array | null; error?: string };
 
+/**
+ * What the embedding stage reads: stage one's preview, not the original photo.
+ * See `embed-worker.ts` for why.
+ */
+export type EmbedInput = { id: string; source: Blob };
+
 function createEmbedWorker(): Worker | null {
   try {
     return new Worker(new URL("./embed-worker.ts", import.meta.url));
@@ -225,7 +231,7 @@ function createEmbedWorker(): Worker | null {
  * cheap similarity signals.
  */
 export async function embedPhotos(
-  inputs: AnalysisInput[],
+  inputs: EmbedInput[],
   onProgress?: ProgressHandler,
 ): Promise<EmbeddingResult[]> {
   if (inputs.length === 0) return [];
@@ -266,7 +272,7 @@ export async function embedPhotos(
   );
 }
 
-function runEmbedWorker(worker: Worker, input: AnalysisInput): Promise<EmbeddingResult> {
+function runEmbedWorker(worker: Worker, input: EmbedInput): Promise<EmbeddingResult> {
   return new Promise((resolve) => {
     const cleanup = () => {
       worker.removeEventListener("message", onMessage);
@@ -291,7 +297,7 @@ function runEmbedWorker(worker: Worker, input: AnalysisInput): Promise<Embedding
     worker.addEventListener("message", onMessage);
     worker.addEventListener("error", onError);
 
-    const request: EmbedRequest = { id: input.id, blob: input.file };
+    const request: EmbedRequest = { id: input.id, blob: input.source };
     worker.postMessage(request);
   });
 }
