@@ -317,11 +317,20 @@ batch is kept, and within it only photos that can still appear — the pool
 steering re-chooses from, whatever is shown, and anything that could not be
 scored.
 
-Originals stay in memory for the session. That survives navigating from the
-upload screen to the review screen, but not a reload — the deliberate trade.
-After a reload the grid still renders from previews and the review screen says
-that saving needs the photos picked again, because handing a downscaled preview
-to the camera roll would be worse than saying so.
+Originals for the **currently selected** photos are persisted, under a byte
+budget, and kept in step as steering changes the selection. Everything else
+lives in memory for the session only.
+
+Memory alone was not enough, and the way it failed is worth remembering: iOS
+discards and reloads a tab under memory pressure — exactly what a large batch
+causes — and the user never sees the reload happen. They just find the save
+button gone, which is the one thing the app exists to do. Persisting the
+selection is bounded (a dozen photos, not hundreds) so it cannot grow back into
+the quota problem that made storing every original untenable.
+
+If the originals really are gone, the grid still renders from previews and the
+screen says the photos cannot be saved, because handing a downscaled preview to
+the camera roll would be worse than saying so.
 
 If a save still fails for space, storage is cleared and the save retried once.
 
@@ -352,30 +361,95 @@ rejection, being unambiguous, is a straight penalty.
 Steering degrades rather than misbehaves without embeddings: the controls only
 appear when the model ran, and pinning and dropping still work if it did not.
 
+## Memory, and why concurrency is capped
+
+The app's failure mode on iPhone is not an error message. It is the tab being
+discarded and reloaded: the upload resets to "Choose photos" partway through,
+or the save button vanishes from a screen the user never reloaded. Nothing in
+the console, because the console went with it.
+
+Every worker decoding a photo holds a full-resolution bitmap — ~48 MB for a
+12 MP photo — and every embedding worker holds its own copy of the model plus
+the runtime's WASM heap on top of that. So concurrency is bounded by memory,
+not by cores:
+
+- **Stage one: at most 3 workers.** The fourth was measured at about 1% (1312ms
+  against 1296ms), which is not worth ~48 MB.
+- **Stage two: exactly 1.** This is the memory peak of the whole app. Inference
+  is single-threaded per session anyway, so a second worker only bought
+  overlap — at the price of the batch surviving.
+- **The shortlist is twice the slots, not three times**, cutting a third off
+  the most expensive stage.
+
+Together these made a 120-photo batch *faster* here (10s against 15s), because
+the work removed was worth more than the parallelism given up.
+
+If a batch is interrupted anyway, a marker written before the work and cleared
+after it means the next visit can say so, rather than leaving the user staring
+at a reset form wondering what they did wrong.
+
+## The finishing phase
+
+Work continues after the last photo is measured — re-choosing with embeddings,
+then writing the batch — and it used to happen behind a progress bar frozen at
+"36 of 36". That reads as a hang, not as work, and on a phone the silence is
+long enough to give up on. Measured on 120 photos, that tail was around ten
+seconds on a desktop; a phone with real photos is far worse.
+
+So there is now an explicit **Finishing** phase, and the code yields to a paint
+before the blocking step — otherwise React never gets to draw the label and the
+screen stays frozen on the last line it managed.
+
+Two things also came off the critical path:
+
+- **Persisting originals no longer blocks navigation.** It makes saving survive
+  a reload, but the review screen works from the in-memory copies regardless,
+  so writing tens of megabytes must not sit between the user and their photos.
+- **Only the pool is stored, and only read back when needed.** Scores for
+  photos that can never reappear are dropped rather than cloned into storage,
+  and originals are read back from storage only when the in-memory copies are
+  gone.
+
 ## Known limit: batch size
 
-**Around 175 photos is the practical cap.** 250 was tried on an iPhone and
-nothing happened — the batch never got as far as analysis. Not yet diagnosed,
-and deliberately left alone for now.
+**Around 175 photos is the practical cap. 250 crashes.**
 
-What is already ruled out: storage. Originals are no longer persisted at all,
-so a 250-photo batch writes roughly 10 MB of previews, not gigabytes (see
-[Storage](#storage)). The remaining candidates, in rough order of suspicion:
+The failure is now pinned down: at 250 the page is discarded during the
+*embedding* stage, not before analysis as first assumed. That is memory, and it
+is the same cause as the smaller failures already fixed — a stage that holds
+the model, the runtime's heap and a full-resolution decode at once. The
+concurrency cuts made 120 reliable; 250 still exceeds it.
 
-1. **The iOS import step.** Safari transcodes every selected photo from HEIC to
-   JPEG before handing any of them over, with no progress indication, and it
-   scales with the count — 250 photos is a long silence, and it may simply give
-   up. This failure happens before any of this app's code runs.
-2. **Memory.** Two embedding workers each hold a copy of the model, and stage
-   one decodes photos in parallel across a worker per core. A tab that is
-   already near iOS's ceiling has no room left for the picker to stage files.
-3. **Something in the pipeline that is quadratic in batch size.** Duplicate
-   grouping compares each photo against every group, which is fine at 50 and
-   worth measuring at 250.
+Left alone for now, by choice. The app at least says so: a batch that starts
+and never finishes leaves a marker, so the next visit explains that the phone
+stopped the page rather than showing a bare form.
 
-Distinguishing these needs a device. The obvious first probe is whether 250
-photos behave any differently with the picker's **Format** set to **Current**,
-which skips the transcode entirely.
+Ruled out: **storage** (originals are no longer persisted, so a 250-photo batch
+writes ~10 MB of previews) and **the iOS import step** (the crash happens well
+after import, during embedding).
+
+What is left is peak memory in the embedding stage, and the next lever is
+decoding at reduced resolution so a worker never holds a ~48 MB full-resolution
+bitmap. That wants care rather than enthusiasm: decoding smaller is itself a
+blur, and the focus thresholds in `scoring.ts` were calibrated at 512px, so the
+blur measurements would have to be re-checked against the new size before
+trusting anything the scorer says.
+
+## Saying why a photo was picked
+
+The review screen shows a reason per photo rather than a score.
+
+The score stopped explaining anything several changes ago: on a real batch every
+survivor lands between 0.85 and 0.96, while the decision is actually made by
+duplicate collapsing, subject diversity and the user's own taps. A number that
+tight implies a ranking that is not the one doing the choosing — and the user
+judges every future scoring change by whatever the tile says.
+
+Reasons are ordered by what a person would find informative, not by what the
+algorithm weighted most: an explicit tap first ("you kept this"), then standing
+in for near-duplicates ("best of 4"), then remembered taste ("like your picks"),
+then whether the photo is here on merit ("top quality") or to cover new ground
+("different subject").
 
 ## Preferences across batches
 

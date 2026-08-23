@@ -8,11 +8,19 @@ import SaveToPhotosButton, { type SharePhoto } from "@/components/SaveToPhotosBu
 import {
   getOriginals,
   loadSession,
+  loadStoredOriginals,
+  storeSelectedOriginals,
   updateSteering,
   type BrowserSession,
   type StoredScore,
 } from "@/lib/browser-session";
-import { selectWithSteering, type ScoredPhoto, type Steering } from "@/lib/scoring";
+import {
+  explainPicks,
+  reasonLabel,
+  selectWithSteering,
+  type ScoredPhoto,
+  type Steering,
+} from "@/lib/scoring";
 import {
   countRemembered,
   exemplars,
@@ -46,6 +54,8 @@ type Loaded = {
   types: Map<string, string>;
   scored: StoredScore[];
   pool: StoredScore[];
+  /** Photo id to how many near-duplicates it beat. */
+  alternates: Map<string, number>;
   summary: Summary;
 };
 
@@ -56,7 +66,7 @@ function Review() {
   const [state, setState] = useState<State>({ phase: "loading" });
   const [steering, setSteering] = useState<Steering>({ liked: [], rejected: [] });
   const [preferences, setPreferences] = useState<Preferences>(NO_PREFERENCES);
-  const [showScores, setShowScores] = useState(false);
+  const [showWhy, setShowWhy] = useState(false);
 
   useEffect(() => {
     if (!sessionId) {
@@ -75,16 +85,24 @@ function Review() {
         return;
       }
 
-      // Originals if this is the same page load that picked them; previews
-      // otherwise. Previews are fine to look at and useless to save.
-      const originals = getOriginals(sessionId);
+      // In-memory originals if this is the same page load that picked them;
+      // otherwise the ones persisted for the selection. Previews are fine to
+      // look at and useless to save, so they are the last resort.
+      const remembered = getOriginals(sessionId);
+      // Only read them back when memory is empty — on the common path, right
+      // after an upload, the originals are already here, and reading tens of
+      // megabytes of files back would delay the grid for nothing.
+      const persisted = remembered ? new Map<string, File>() : await loadStoredOriginals(sessionId);
+      if (cancelled) return;
+
+      const originals = new Map<string, File>([...persisted, ...(remembered ?? [])]);
       const urls = new Map<string, string>();
       const files = new Map<string, File>();
       const names = new Map<string, string>();
       const types = new Map<string, string>();
 
       for (const photo of session.photos) {
-        const original = originals?.get(photo.id) ?? null;
+        const original = originals.get(photo.id) ?? null;
         const source = original ?? photo.preview;
         if (!source) continue;
 
@@ -113,6 +131,9 @@ function Review() {
           types,
           scored: session.scores,
           pool: pool.length > 0 ? pool : session.scores,
+          alternates: new Map(
+            session.duplicateGroups.map((group) => [group.bestId, group.alternateIds.length]),
+          ),
           summary: {
             total: session.totalPhotos ?? session.photos.length,
             rejectedCount: session.rejectedCount,
@@ -169,8 +190,31 @@ function Review() {
       selected.map((photo) => photo.id),
     );
 
-    // Teach the next batch what this one was told, keyed by session so undoing
-    // a tap undoes what was learned from it.
+    // Steering changes what is selected, so keep the saved originals in step
+    // with it — otherwise a photo steering brought in could be shown but not
+    // saved after a reload.
+    const available = getOriginals(data.sessionId);
+    if (available) {
+      void storeSelectedOriginals(
+        data.sessionId,
+        available,
+        selected.map((photo) => photo.id),
+      );
+    }
+  }, [data, steering, selected]);
+
+  /**
+   * Recording preferences depends only on what the user said, never on what
+   * was selected as a result.
+   *
+   * Sharing an effect with the code above meant that changing preferences
+   * changed the selection, which re-ran this, which read-modify-wrote the
+   * preferences back — so Forget cleared them and then immediately restored
+   * them from the read that was already in flight.
+   */
+  useEffect(() => {
+    if (!data) return;
+
     const embeddingOf = (id: string) =>
       data.scored.find((photo) => photo.id === id)?.embedding ?? null;
     const collect = (ids: string[]) =>
@@ -181,7 +225,7 @@ function Review() {
       collect(steering.liked),
       collect(steering.rejected),
     ).then(setPreferences);
-  }, [data, steering, selected]);
+  }, [data, steering]);
 
   const steer = useCallback((id: string, action: "like" | "reject") => {
     setSteering((current) => {
@@ -221,7 +265,7 @@ function Review() {
     );
   }
 
-  const { summary, urls, files, names, types } = state.data;
+  const { summary, urls, files, names, types, alternates } = state.data;
   const rememberedCount = countRemembered({
     batches: preferences.batches.filter((batch) => batch.sessionId !== state.data.sessionId),
   });
@@ -240,12 +284,19 @@ function Review() {
     url: urls.get(photo.id)!,
   }));
 
+  // Why each photo is here, rather than a score: on a real batch every
+  // survivor lands within a few hundredths, and the number describes a signal
+  // that stopped being the deciding one several changes ago.
+  const reasons = explainPicks(shown, { steering, remembered, alternates });
+
   const gridPhotos = shown.map((photo) => ({
     id: photo.id,
     name: names.get(photo.id) ?? photo.id,
     url: urls.get(photo.id)!,
-    badge: showScores ? photo.score.toFixed(2) : undefined,
-    note: showScores ? photo.rejectedFor : null,
+    badge: showWhy
+      ? reasonLabel(reasons.get(photo.id) ?? "top-quality", alternates.get(photo.id) ?? 0)
+      : undefined,
+    note: showWhy ? photo.rejectedFor : null,
     liked: likedIds.has(photo.id),
     onLike: summary.steerable ? () => steer(photo.id, "like") : undefined,
     onReject: summary.steerable ? () => steer(photo.id, "reject") : undefined,
@@ -303,9 +354,9 @@ function Review() {
         <button
           type="button"
           className="link-button small"
-          onClick={() => setShowScores((shown) => !shown)}
+          onClick={() => setShowWhy((on) => !on)}
         >
-          {showScores ? "Hide scores" : "Show scores"}
+          {showWhy ? "Hide reasons" : "Why these?"}
         </button>
         {(steering.liked.length > 0 || steering.rejected.length > 0) && (
           <button
@@ -318,13 +369,21 @@ function Review() {
         )}
       </div>
 
+      {shown.length > saveable.length && saveable.length > 0 && (
+        <p className="muted small">
+          {shown.length - saveable.length} of these can’t be saved: they came into the
+          selection after the page reloaded, and the full-quality photos behind them are
+          no longer on the device. Pick the batch again to save everything.
+        </p>
+      )}
+
       {summary.canSave ? (
         <SaveToPhotosButton photos={sharePhotos} />
       ) : (
         <p className="muted small">
-          These are stored previews — the full-quality photos aren’t kept on the device
-          after a reload, because a batch of them is far more than a website is allowed
-          to store. Pick the batch again to save it to your camera roll.
+          These are previews — the full-quality photos behind them are no longer on the
+          device, so they can’t be saved to your camera roll. Pick the batch again to
+          save it.
         </p>
       )}
 

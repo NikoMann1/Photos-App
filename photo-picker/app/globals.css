@@ -160,16 +160,21 @@ h2 {
   position: relative;
 }
 
+/* A reason, not a number: it has to stay readable over any photo and wrap
+   inside a small tile without covering it. */
 .badge {
   position: absolute;
   top: 4px;
   left: 4px;
-  padding: 2px 6px;
+  right: 4px;
+  padding: 3px 6px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgba(0, 0, 0, 0.72);
   color: var(--text);
-  font-size: 0.72rem;
-  font-variant-numeric: tabular-nums;
+  font-size: 0.68rem;
+  line-height: 1.25;
+  text-align: center;
+  backdrop-filter: blur(2px);
 }
 
 .note {

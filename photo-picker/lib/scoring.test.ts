@@ -9,6 +9,8 @@ import {
   selectBestPhotos,
   selectionSize,
   NO_TASTE,
+  explainPicks,
+  reasonLabel,
   selectWithSteering,
   shortlistForEmbedding,
   similarity,
@@ -460,4 +462,46 @@ test("remembered taste never outweighs a tap in the current batch", () => {
     remembered,
   );
   assert.ok(steered.some((p) => p.id === "wanted0"), "the tap is still honoured");
+});
+
+test("a pick explains itself by the reason a person would care about", () => {
+  const base = subject(0, 1, "plain")[0];
+  const liked = subject(1, 1, "liked")[0];
+  const deduped = subject(2, 1, "group")[0];
+
+  const reasons = explainPicks([liked, deduped, base], {
+    steering: { liked: ["liked0"], rejected: [] },
+    remembered: NO_TASTE,
+    alternates: new Map([["group0", 3]]),
+  });
+
+  assert.equal(reasons.get("liked0"), "kept", "an explicit tap outranks every other reason");
+  assert.equal(reasons.get("group0"), "best-of-similar");
+  assert.equal(reasonLabel("best-of-similar", 3), "best of 4", "counts the photo it stood in for");
+});
+
+test("remembered taste is named when it is what put a photo here", () => {
+  const engine = subject(0, 1, "engine")[0];
+  const reasons = explainPicks([engine], {
+    steering: { liked: [], rejected: [] },
+    remembered: { liked: [engine.embedding!], rejected: [] },
+    alternates: new Map(),
+  });
+  assert.equal(reasons.get("engine0"), "like-your-picks");
+});
+
+test("later picks are distinguished by whether they cover new ground", () => {
+  const first = subject(0, 1, "a")[0];
+  const nearlyTheSame = subject(0, 2, "a2")[1];
+  const unrelated = subject(3, 1, "b")[0];
+
+  const reasons = explainPicks([first, nearlyTheSame, unrelated], {
+    steering: { liked: [], rejected: [] },
+    remembered: NO_TASTE,
+    alternates: new Map(),
+  });
+
+  assert.equal(reasons.get("a0"), "top-quality", "the first pick is not about coverage");
+  assert.equal(reasons.get("a21"), "top-quality", "a near-copy is here on merit, not novelty");
+  assert.equal(reasons.get("b0"), "different-subject");
 });
