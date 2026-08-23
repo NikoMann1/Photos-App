@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ImageMetrics } from "./analysis/metrics";
+import { contentScore } from "./analysis/aesthetic";
 import {
   MAX_SELECTION,
   MIN_SELECTION,
@@ -14,6 +15,11 @@ import {
   selectWithSteering,
   shortlistForEmbedding,
   similarity,
+  contentBaseline,
+  contentBias,
+  steeredTaste,
+  tasteBias,
+  tasteDirection,
   type AnalyzedPhoto,
   type ScoredPhoto,
 } from "./scoring";
@@ -47,6 +53,8 @@ function metrics(overrides: Partial<ImageMetrics> = {}): ImageMetrics {
     ...overrides,
   };
 }
+
+const NO_STEERING_IDS = { liked: [], rejected: [] };
 
 let nextId = 0;
 function photo(overrides: Partial<ImageMetrics> = {}, extra: Partial<AnalyzedPhoto> = {}): AnalyzedPhoto {
@@ -504,4 +512,263 @@ test("later picks are distinguished by whether they cover new ground", () => {
   assert.equal(reasons.get("a0"), "top-quality", "the first pick is not about coverage");
   assert.equal(reasons.get("a21"), "top-quality", "a near-copy is here on merit, not novelty");
   assert.equal(reasons.get("b0"), "different-subject");
+});
+
+// ---------------------------------------------------------------------------
+// Judgement
+// ---------------------------------------------------------------------------
+
+/** A unit vector with the given weights on the given axes. */
+function vector(weights: Record<number, number>, dims = 512): Float32Array {
+  const v = new Float32Array(dims);
+  for (const [axis, weight] of Object.entries(weights)) v[Number(axis)] = weight;
+  const norm = Math.hypot(...v);
+  for (let i = 0; i < dims; i++) v[i] /= norm;
+  return v;
+}
+
+/** Axis 0 is what kept and dropped photos share; 1 and 2 are what separates them. */
+const SHARED = vector({ 0: 1 });
+const KEPT_SIDE = vector({ 0: 1, 1: 1 });
+const DROPPED_SIDE = vector({ 0: 1, 2: 1 });
+
+function scoredWith(embedding: Float32Array, id: string): ScoredPhoto {
+  return scorePhoto(photo({}, { id, embedding }));
+}
+
+test("judgement waits for both sides before it decides anything", () => {
+  const kept = [KEPT_SIDE, KEPT_SIDE, KEPT_SIDE];
+  const dropped = [DROPPED_SIDE, DROPPED_SIDE, DROPPED_SIDE];
+
+  assert.equal(tasteDirection(kept, []), null, "keeps alone say what you like, not what you don't");
+  assert.equal(tasteDirection([], dropped), null);
+  assert.equal(tasteDirection(kept.slice(0, 2), dropped), null, "two taps is a quirk, not a taste");
+
+  const taste = tasteDirection(kept, dropped);
+  assert.ok(taste, "three of each is enough to learn from");
+  assert.ok(taste!.confidence > 0 && taste!.confidence < 1, "little evidence pulls gently");
+  assert.equal(tasteDirection(
+    Array.from({ length: 20 }, () => KEPT_SIDE),
+    Array.from({ length: 20 }, () => DROPPED_SIDE),
+  )!.confidence, 1, "plenty of evidence pulls at full strength");
+});
+
+test("judgement learns what separates keeps from drops, not what they have in common", () => {
+  const taste = tasteDirection(
+    Array.from({ length: 10 }, () => KEPT_SIDE),
+    Array.from({ length: 10 }, () => DROPPED_SIDE),
+  );
+
+  const likeKeeps = tasteBias(scoredWith(KEPT_SIDE, "keep"), taste);
+  const likeDrops = tasteBias(scoredWith(DROPPED_SIDE, "drop"), taste);
+  const shared = tasteBias(scoredWith(SHARED, "shared"), taste);
+
+  assert.ok(likeKeeps > 0, "a photo on the kept side is promoted");
+  assert.ok(likeDrops < 0, "and one on the dropped side is demoted, not merely ignored");
+  assert.ok(Math.abs(shared) < 1e-6, "what both sides share is no evidence either way");
+
+  // The rule this replaces cannot make that distinction: measured only by
+  // resemblance to a kept photo, the shared subject looks like a keeper.
+  const reasons = explainPicks([scoredWith(SHARED, "shared")], {
+    steering: NO_STEERING_IDS,
+    remembered: { liked: [KEPT_SIDE], rejected: [] },
+    alternates: new Map(),
+  });
+  assert.equal(reasons.get("shared"), "like-your-picks");
+});
+
+test("judgement is inert on photos it cannot see the content of", () => {
+  const taste = tasteDirection(
+    Array.from({ length: 10 }, () => KEPT_SIDE),
+    Array.from({ length: 10 }, () => DROPPED_SIDE),
+  );
+  const blind = scorePhoto(photo({}, { id: "blind", embedding: null }));
+  assert.equal(tasteBias(blind, taste), 0, "not knowing is not evidence against");
+  assert.equal(tasteBias(scoredWith(KEPT_SIDE, "sighted"), null), 0);
+});
+
+test("this batch's taps sharpen judgement on this batch, not only the next one", () => {
+  const candidates = [
+    ...Array.from({ length: 3 }, (_, i) => scoredWith(KEPT_SIDE, `keep${i}`)),
+    ...Array.from({ length: 3 }, (_, i) => scoredWith(DROPPED_SIDE, `drop${i}`)),
+    scoredWith(SHARED, "other"),
+  ];
+  const steering = {
+    liked: ["keep0", "keep1", "keep2"],
+    rejected: ["drop0", "drop1", "drop2"],
+  };
+
+  assert.equal(steeredTaste(candidates, NO_STEERING_IDS), null, "nothing said, nothing learned");
+  assert.ok(steeredTaste(candidates, steering), "taps in the current batch count as evidence");
+});
+
+test("a strong opinion still leaves room for other subjects", () => {
+  // The failure this guards against: a learned preference that wins
+  // photo-for-photo against novelty returns a screenful of the same thing.
+  const favourite = Array.from({ length: 8 }, (_, i) => scoredWith(KEPT_SIDE, `fav${i}`));
+  const others = [
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(vector({ 3: 1 }), `x${i}`)),
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(vector({ 4: 1 }), `y${i}`)),
+  ];
+  const remembered = {
+    liked: Array.from({ length: 20 }, () => KEPT_SIDE),
+    rejected: Array.from({ length: 20 }, () => DROPPED_SIDE),
+  };
+
+  const picked = selectWithSteering([...favourite, ...others], NO_STEERING_IDS, undefined, remembered);
+  const favourites = picked.filter((p) => p.id.startsWith("fav")).length;
+
+  assert.ok(favourites >= 1, "the subject the user keeps must be represented");
+  assert.ok(
+    favourites < picked.length,
+    `judgement crowded out every other subject: ${picked.map((p) => p.id).join(", ")}`,
+  );
+});
+
+test("judgement can say why, once it has learned enough to be worth saying", () => {
+  const taste = tasteDirection(
+    Array.from({ length: 10 }, () => KEPT_SIDE),
+    Array.from({ length: 10 }, () => DROPPED_SIDE),
+  );
+  const reasons = explainPicks([scoredWith(KEPT_SIDE, "yours"), scoredWith(DROPPED_SIDE, "not")], {
+    steering: NO_STEERING_IDS,
+    remembered: NO_TASTE,
+    alternates: new Map(),
+    taste,
+  });
+
+  assert.equal(reasons.get("yours"), "like-your-picks");
+  assert.notEqual(reasons.get("not"), "like-your-picks", "the other side is never claimed as taste");
+});
+
+// ---------------------------------------------------------------------------
+// Judgement with nothing taught: the general prior
+// ---------------------------------------------------------------------------
+
+/**
+ * Basis vectors the content head rates highest and lowest, found by asking it
+ * rather than by hard-coding numbers that a retrained head would invalidate.
+ */
+function contentExtremes(): { best: Float32Array; worst: Float32Array } {
+  let best = 0;
+  let worst = 0;
+  for (let axis = 0; axis < 512; axis++) {
+    const here = contentScore(vector({ [axis]: 1 }))!;
+    if (here > contentScore(vector({ [best]: 1 }))!) best = axis;
+    if (here < contentScore(vector({ [worst]: 1 }))!) worst = axis;
+  }
+  return { best: vector({ [best]: 1 }), worst: vector({ [worst]: 1 }) };
+}
+
+test("the content head judges a photograph without being taught anything", () => {
+  const { best, worst } = contentExtremes();
+  assert.ok(
+    contentScore(best)! > contentScore(worst)!,
+    "the head has to separate something, or it is 2 KB of nothing",
+  );
+  assert.equal(contentScore(null), null, "no embedding is no opinion, not a low score");
+  assert.equal(contentScore(new Float32Array(64)), null, "a wrong-sized vector is refused");
+});
+
+test("content is judged against the batch, never against a fixed bar", () => {
+  // The head is trained on contest photographs and a real phone batch scores
+  // far below its median; an absolute threshold would reject the whole roll.
+  const { best, worst } = contentExtremes();
+  const batch = [
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(worst, `dull${i}`)),
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(best, `good${i}`)),
+  ];
+
+  const baseline = contentBaseline(batch);
+  assert.ok(baseline, "a batch of eight has a distribution to sit in");
+  assert.ok(
+    contentBias(batch.at(-1)!, baseline) > 0 && contentBias(batch[0], baseline) < 0,
+    "the batch's own median is the zero point",
+  );
+
+  // A batch that is uniformly poor by the head's absolute scale still has a
+  // best photo, and it is the one that gets promoted.
+  const allDull = Array.from({ length: 6 }, (_, i) => scoredWith(worst, `d${i}`));
+  assert.equal(
+    contentBias(allDull[0], contentBaseline(allDull)),
+    0,
+    "with nothing to choose between, content says nothing",
+  );
+
+  assert.equal(contentBaseline(batch.slice(0, 3)), null, "three photos are not a distribution");
+});
+
+test("with nothing taught, the better photograph wins between equal-quality shots", () => {
+  const { best, worst } = contentExtremes();
+  const batch = [
+    ...Array.from({ length: 6 }, (_, i) => scoredWith(worst, `dull${i}`)),
+    ...Array.from({ length: 6 }, (_, i) => scoredWith(best, `good${i}`)),
+  ];
+
+  // No taps at all — the cold start this exists for.
+  const picked = selectWithSteering(batch, NO_STEERING_IDS);
+  assert.ok(
+    picked.filter((p) => p.id.startsWith("good")).length >
+      picked.filter((p) => p.id.startsWith("dull")).length,
+    `content judgement did nothing: ${picked.map((p) => p.id).join(", ")}`,
+  );
+});
+
+test("the general prior gets out of the way where the user has spoken", () => {
+  const { worst } = contentExtremes();
+  const dull = scoredWith(worst, "dull0");
+  const baseline = contentBaseline([
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(worst, `d${i}`)),
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(vector({ 7: 1 }), `o${i}`)),
+  ]);
+
+  const unopposed = contentBias(dull, baseline);
+  assert.ok(unopposed < 0, "on its own the head demotes it");
+
+  // Same photo, but the user kept one like it in an earlier batch.
+  const steered = selectWithSteering(
+    [dull, ...Array.from({ length: 6 }, (_, i) => scoredWith(vector({ 7: 1 }), `other${i}`))],
+    NO_STEERING_IDS,
+    undefined,
+    { liked: [worst], rejected: [] },
+  );
+  assert.ok(
+    steered.some((p) => p.id === "dull0"),
+    "a model trained on contest photography does not overrule the user",
+  );
+});
+
+/**
+ * A basis vector the head scores near `target`. Basis vectors are orthogonal,
+ * so this varies content judgement while holding subject similarity at zero —
+ * which blending toward the head's own extremes cannot do, since that makes
+ * every photo resemble every other.
+ */
+function axisNear(target: number): Float32Array {
+  let best = 0;
+  for (let axis = 0; axis < 512; axis++) {
+    const here = Math.abs(contentScore(vector({ [axis]: 1 }))! - target);
+    if (here < Math.abs(contentScore(vector({ [best]: 1 }))! - target)) best = axis;
+  }
+  return vector({ [best]: 1 });
+}
+
+test("across the spread a real batch has, coverage still beats the general prior", () => {
+  // The user's own batch spanned 3.97 to 4.77 on this head — 0.8 points. Over
+  // a gap that size, a subject the head likes must not take every slot, even
+  // when every photo of it is a near-copy of the last.
+  const cluster = Array.from({ length: 8 }, (_, i) => scoredWith(axisNear(4.8), `same${i}`));
+  const others = [
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(axisNear(4.0), `x${i}`)),
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(axisNear(4.05), `y${i}`)),
+  ];
+
+  const picked = selectWithSteering([...cluster, ...others], NO_STEERING_IDS);
+  const fromCluster = picked.filter((p) => p.id.startsWith("same")).length;
+
+  assert.ok(fromCluster >= 1, "the best-judged subject must be represented");
+  assert.ok(
+    fromCluster < picked.length,
+    `content judgement crowded out every other subject: ${picked.map((p) => p.id).join(", ")}`,
+  );
 });

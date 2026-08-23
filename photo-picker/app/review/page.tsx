@@ -18,6 +18,8 @@ import {
   explainPicks,
   reasonLabel,
   selectWithSteering,
+  contentBaseline,
+  steeredTaste,
   type ScoredPhoto,
   type Steering,
 } from "@/lib/scoring";
@@ -266,6 +268,9 @@ function Review() {
   }
 
   const { summary, urls, files, names, types, alternates } = state.data;
+  // What the taps so far say about which photos were worth taking.
+  const taste = steeredTaste(state.data.pool as unknown as ScoredPhoto[], steering, remembered);
+  const content = contentBaseline(state.data.pool as unknown as ScoredPhoto[]);
   const rememberedCount = countRemembered({
     batches: preferences.batches.filter((batch) => batch.sessionId !== state.data.sessionId),
   });
@@ -287,7 +292,7 @@ function Review() {
   // Why each photo is here, rather than a score: on a real batch every
   // survivor lands within a few hundredths, and the number describes a signal
   // that stopped being the deciding one several changes ago.
-  const reasons = explainPicks(shown, { steering, remembered, alternates });
+  const reasons = explainPicks(shown, { steering, remembered, alternates, taste, content });
 
   const gridPhotos = shown.map((photo) => ({
     id: photo.id,
@@ -333,6 +338,13 @@ function Review() {
           Tap <strong>♥</strong> to keep a photo and get more like it, <strong>✕</strong> to
           drop it and photos like it. The rest re-shuffle around your choices.
           {steering.rejected.length > 0 && ` ${steering.rejected.length} dropped.`}
+        </p>
+      )}
+
+      {taste && (
+        <p className="muted small">
+          Enough keeps and drops to tell your kind of photo from the rest — that now
+          counts towards which ones are chosen.
         </p>
       )}
 
