@@ -121,6 +121,16 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
+/**
+ * IndexedDB transactions go inactive as soon as control returns to the event
+ * loop with no request pending. So every request in a transaction must be
+ * *issued* before the first await — awaiting one and then issuing another
+ * throws TransactionInactiveError.
+ *
+ * Chromium is lenient about this and Safari is not, which is exactly the shape
+ * of bug that passes every test here and fails only on the device: the throw
+ * was caught, an empty result returned, and every saved photo looked missing.
+ */
 function promisify<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
@@ -194,9 +204,12 @@ export async function deleteOtherSessions(keepId: string | null): Promise<void> 
   try {
     const db = await openDb();
     try {
+      const keys = await promisify<IDBValidKey[]>(
+        db.transaction(STORE, "readonly").objectStore(STORE).getAllKeys(),
+      );
+
       const tx = db.transaction(STORE, "readwrite");
       const store = tx.objectStore(STORE);
-      const keys = await promisify<IDBValidKey[]>(store.getAllKeys());
       for (const key of keys) {
         if (key !== keepId) store.delete(key);
       }
@@ -290,6 +303,13 @@ async function writeSelectedOriginals(
   try {
     const db = await openDb();
     try {
+      // Read the existing keys in their own transaction, so the writing one
+      // never has to await mid-flight.
+      const readTx = db.transaction(ORIGINALS_STORE, "readonly");
+      const existing = await promisify<IDBValidKey[]>(
+        readTx.objectStore(ORIGINALS_STORE).getAllKeys(),
+      );
+
       const tx = db.transaction(ORIGINALS_STORE, "readwrite");
       const store = tx.objectStore(ORIGINALS_STORE);
 
@@ -310,7 +330,6 @@ async function writeSelectedOriginals(
         store.put(file, key);
       }
 
-      const existing = await promisify<IDBValidKey[]>(store.getAllKeys());
       for (const key of existing) {
         if (!wanted.has(String(key))) store.delete(key);
       }
@@ -336,15 +355,23 @@ export async function loadStoredOriginals(sessionId: string): Promise<Map<string
     try {
       const tx = db.transaction(ORIGINALS_STORE, "readonly");
       const store = tx.objectStore(ORIGINALS_STORE);
-      const keys = await promisify<IDBValidKey[]>(store.getAllKeys());
-      const prefix = `${sessionId}:`;
 
-      for (const key of keys) {
+      // Both requests issued before either is awaited — see promisify.
+      const keysRequest = store.getAllKeys();
+      const valuesRequest = store.getAll();
+      const [keys, values] = await Promise.all([
+        promisify<IDBValidKey[]>(keysRequest),
+        promisify<File[]>(valuesRequest),
+      ]);
+
+      const prefix = `${sessionId}:`;
+      keys.forEach((key, index) => {
         const name = String(key);
-        if (!name.startsWith(prefix)) continue;
-        const file = await promisify<File | undefined>(store.get(key));
-        if (file) found.set(name.slice(prefix.length), file);
-      }
+        const file = values[index];
+        if (name.startsWith(prefix) && file) {
+          found.set(name.slice(prefix.length), file);
+        }
+      });
     } finally {
       db.close();
     }
