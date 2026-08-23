@@ -16,7 +16,7 @@
 import type { PhotoMeta, ScoredPhoto, Steering } from "./scoring";
 
 const DB_NAME = "photo-picker";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = "sessions";
 
 /**
@@ -25,6 +25,21 @@ const STORE = "sessions";
  * must outlive them.
  */
 export const PREFERENCES_STORE = "preferences";
+
+/**
+ * Originals for the photos currently selected, so saving survives a reload.
+ *
+ * Keeping originals only in memory was wrong: iOS discards and reloads a tab
+ * under memory pressure, which is exactly what a large batch causes, and the
+ * user never sees a reload happen — they just find the save button gone, which
+ * is the one thing the app exists to do. Only the selection is stored, and
+ * under a byte budget, so this cannot grow back into the quota problem that
+ * made storing every original untenable.
+ */
+export const ORIGINALS_STORE = "originals";
+
+/** Roughly 40 photos at iPhone sizes; the selection is far smaller in practice. */
+const ORIGINALS_BUDGET_BYTES = 150 * 1024 * 1024;
 
 /**
  * Only the newest batch is kept.
@@ -96,6 +111,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(PREFERENCES_STORE)) {
         db.createObjectStore(PREFERENCES_STORE);
+      }
+      if (!db.objectStoreNames.contains(ORIGINALS_STORE)) {
+        db.createObjectStore(ORIGINALS_STORE);
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -229,6 +247,81 @@ export function rememberOriginals(sessionId: string, files: Map<string, File>): 
 
 export function getOriginals(sessionId: string): Map<string, File> | null {
   return originals.get(sessionId) ?? null;
+}
+
+function originalKey(sessionId: string, photoId: string): string {
+  return `${sessionId}:${photoId}`;
+}
+
+/**
+ * Persists the originals behind the current selection, newest selection wins.
+ *
+ * Called again whenever steering changes what is selected, so the photos the
+ * user can actually see are the photos they can actually save.
+ */
+export async function storeSelectedOriginals(
+  sessionId: string,
+  files: Map<string, File>,
+  selectedIds: string[],
+): Promise<void> {
+  try {
+    const db = await openDb();
+    try {
+      const tx = db.transaction(ORIGINALS_STORE, "readwrite");
+      const store = tx.objectStore(ORIGINALS_STORE);
+
+      // Drop anything not currently selected, including other sessions'.
+      const wanted = new Set(selectedIds.map((id) => originalKey(sessionId, id)));
+      const existing = await promisify<IDBValidKey[]>(store.getAllKeys());
+      for (const key of existing) {
+        if (!wanted.has(String(key))) store.delete(key);
+      }
+
+      let budget = ORIGINALS_BUDGET_BYTES;
+      for (const id of selectedIds) {
+        const file = files.get(id);
+        if (!file || file.size > budget) continue;
+        budget -= file.size;
+        store.put(file, originalKey(sessionId, id));
+      }
+
+      await new Promise<void>((resolve) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Saving originals is best effort; previews still render either way.
+  }
+}
+
+/** Originals persisted for this session, by photo id. */
+export async function loadStoredOriginals(sessionId: string): Promise<Map<string, File>> {
+  const found = new Map<string, File>();
+  try {
+    const db = await openDb();
+    try {
+      const tx = db.transaction(ORIGINALS_STORE, "readonly");
+      const store = tx.objectStore(ORIGINALS_STORE);
+      const keys = await promisify<IDBValidKey[]>(store.getAllKeys());
+      const prefix = `${sessionId}:`;
+
+      for (const key of keys) {
+        const name = String(key);
+        if (!name.startsWith(prefix)) continue;
+        const file = await promisify<File | undefined>(store.get(key));
+        if (file) found.set(name.slice(prefix.length), file);
+      }
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Fall back to previews.
+  }
+  return found;
 }
 
 /** Storage can be unavailable — private browsing, or a locked-down WebView. */

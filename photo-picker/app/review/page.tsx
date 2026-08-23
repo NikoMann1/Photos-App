@@ -8,6 +8,8 @@ import SaveToPhotosButton, { type SharePhoto } from "@/components/SaveToPhotosBu
 import {
   getOriginals,
   loadSession,
+  loadStoredOriginals,
+  storeSelectedOriginals,
   updateSteering,
   type BrowserSession,
   type StoredScore,
@@ -75,16 +77,21 @@ function Review() {
         return;
       }
 
-      // Originals if this is the same page load that picked them; previews
-      // otherwise. Previews are fine to look at and useless to save.
-      const originals = getOriginals(sessionId);
+      // In-memory originals if this is the same page load that picked them;
+      // otherwise the ones persisted for the selection. Previews are fine to
+      // look at and useless to save, so they are the last resort.
+      const remembered = getOriginals(sessionId);
+      const persisted = await loadStoredOriginals(sessionId);
+      if (cancelled) return;
+
+      const originals = new Map<string, File>([...persisted, ...(remembered ?? [])]);
       const urls = new Map<string, string>();
       const files = new Map<string, File>();
       const names = new Map<string, string>();
       const types = new Map<string, string>();
 
       for (const photo of session.photos) {
-        const original = originals?.get(photo.id) ?? null;
+        const original = originals.get(photo.id) ?? null;
         const source = original ?? photo.preview;
         if (!source) continue;
 
@@ -181,6 +188,18 @@ function Review() {
       collect(steering.liked),
       collect(steering.rejected),
     ).then(setPreferences);
+
+    // Steering changes what is selected, so keep the saved originals in step
+    // with it — otherwise a photo steering brought in could be shown but not
+    // saved after a reload.
+    const available = getOriginals(data.sessionId);
+    if (available) {
+      void storeSelectedOriginals(
+        data.sessionId,
+        available,
+        selected.map((photo) => photo.id),
+      );
+    }
   }, [data, steering, selected]);
 
   const steer = useCallback((id: string, action: "like" | "reject") => {
@@ -322,9 +341,9 @@ function Review() {
         <SaveToPhotosButton photos={sharePhotos} />
       ) : (
         <p className="muted small">
-          These are stored previews — the full-quality photos aren’t kept on the device
-          after a reload, because a batch of them is far more than a website is allowed
-          to store. Pick the batch again to save it to your camera roll.
+          These are previews — the full-quality photos behind them are no longer on the
+          device, so they can’t be saved to your camera roll. Pick the batch again to
+          save it.
         </p>
       )}
 

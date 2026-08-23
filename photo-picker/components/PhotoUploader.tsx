@@ -14,6 +14,7 @@ import {
   isStorageAvailable,
   rememberOriginals,
   saveLatestSession,
+  storeSelectedOriginals,
   type StoredPhoto,
 } from "@/lib/browser-session";
 
@@ -187,6 +188,14 @@ export default function PhotoUploader() {
         rejectedCount: selection.rejectedCount,
         unanalyzedIds,
       });
+
+      // Persist the originals behind the selection, so saving survives a
+      // reload — including one iOS does on its own under memory pressure.
+      await storeSelectedOriginals(
+        sessionId,
+        new Map(photos.map((photo) => [photo.id, photo.file])),
+        selectedIds,
+      );
 
       router.push(`/review?session=${sessionId}`);
     } catch (error) {

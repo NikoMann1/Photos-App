@@ -317,11 +317,20 @@ batch is kept, and within it only photos that can still appear — the pool
 steering re-chooses from, whatever is shown, and anything that could not be
 scored.
 
-Originals stay in memory for the session. That survives navigating from the
-upload screen to the review screen, but not a reload — the deliberate trade.
-After a reload the grid still renders from previews and the review screen says
-that saving needs the photos picked again, because handing a downscaled preview
-to the camera roll would be worse than saying so.
+Originals for the **currently selected** photos are persisted, under a byte
+budget, and kept in step as steering changes the selection. Everything else
+lives in memory for the session only.
+
+Memory alone was not enough, and the way it failed is worth remembering: iOS
+discards and reloads a tab under memory pressure — exactly what a large batch
+causes — and the user never sees the reload happen. They just find the save
+button gone, which is the one thing the app exists to do. Persisting the
+selection is bounded (a dozen photos, not hundreds) so it cannot grow back into
+the quota problem that made storing every original untenable.
+
+If the originals really are gone, the grid still renders from previews and the
+screen says the photos cannot be saved, because handing a downscaled preview to
+the camera roll would be worse than saying so.
 
 If a save still fails for space, storage is cleared and the save retried once.
 
