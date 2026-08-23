@@ -352,6 +352,31 @@ rejection, being unambiguous, is a straight penalty.
 Steering degrades rather than misbehaves without embeddings: the controls only
 appear when the model ran, and pinning and dropping still work if it did not.
 
+## Known limit: batch size
+
+**Around 175 photos is the practical cap.** 250 was tried on an iPhone and
+nothing happened — the batch never got as far as analysis. Not yet diagnosed,
+and deliberately left alone for now.
+
+What is already ruled out: storage. Originals are no longer persisted at all,
+so a 250-photo batch writes roughly 10 MB of previews, not gigabytes (see
+[Storage](#storage)). The remaining candidates, in rough order of suspicion:
+
+1. **The iOS import step.** Safari transcodes every selected photo from HEIC to
+   JPEG before handing any of them over, with no progress indication, and it
+   scales with the count — 250 photos is a long silence, and it may simply give
+   up. This failure happens before any of this app's code runs.
+2. **Memory.** Two embedding workers each hold a copy of the model, and stage
+   one decodes photos in parallel across a worker per core. A tab that is
+   already near iOS's ceiling has no room left for the picker to stage files.
+3. **Something in the pipeline that is quadratic in batch size.** Duplicate
+   grouping compares each photo against every group, which is fine at 50 and
+   worth measuring at 250.
+
+Distinguishing these needs a device. The obvious first probe is whether 250
+photos behave any differently with the picker's **Format** set to **Current**,
+which skips the transcode entirely.
+
 ## Still not solved: judgement
 
 None of this can tell a striking composition from a well-exposed photo of
