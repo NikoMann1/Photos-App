@@ -8,6 +8,7 @@ import {
   scorePhoto,
   selectBestPhotos,
   selectionSize,
+  NO_TASTE,
   selectWithSteering,
   shortlistForEmbedding,
   similarity,
@@ -397,4 +398,66 @@ test("steering is inert without embeddings rather than destructive", () => {
   const steered = selectWithSteering(plain, { liked: ["p3"], rejected: ["p0"] });
   assert.ok(steered.some((p) => p.id === "p3"), "pinning works without a model");
   assert.ok(!steered.some((p) => p.id === "p0"), "dropping works without a model");
+});
+
+test("a remembered dislike demotes a subject but never removes it", () => {
+  // The failure this guards against: dropping one bathroom photo permanently
+  // hiding the one with something worth keeping on the wall.
+  const disliked = subject(0, 4, "bath");
+  const neutral = subject(1, 4, "other");
+  const all = [...disliked, ...neutral];
+  const remembered = { liked: [], rejected: [disliked[0].embedding!] };
+
+  const withMemory = selectWithSteering(all, { liked: [], rejected: [] }, undefined, remembered);
+  const without = selectWithSteering(all, { liked: [], rejected: [] }, undefined, NO_TASTE);
+
+  const count = (list: typeof all) => list.filter((p) => p.id.startsWith("bath")).length;
+  assert.ok(
+    count(withMemory) <= count(without),
+    "a remembered dislike should not increase its subject's representation",
+  );
+  assert.ok(
+    withMemory.length === without.length,
+    "demotion must not shrink the selection — only an explicit drop removes photos",
+  );
+});
+
+test("an explicit drop still removes outright, unlike a remembered one", () => {
+  const photos = subject(0, 4, "a").concat(subject(1, 4, "b"));
+  const dropped = selectWithSteering(photos, { liked: [], rejected: ["a0"] });
+  assert.ok(!dropped.some((p) => p.id === "a0"));
+});
+
+test("remembered tastes do not average into something meaning neither", () => {
+  // Liking two unrelated subjects must favour both, not their midpoint.
+  const engines = subject(0, 4, "engine");
+  const views = subject(3, 4, "view");
+  const filler = subject(1, 6, "filler");
+  const remembered = {
+    liked: [engines[0].embedding!, views[0].embedding!],
+    rejected: [],
+  };
+
+  const steered = selectWithSteering(
+    [...engines, ...views, ...filler],
+    { liked: [], rejected: [] },
+    undefined,
+    remembered,
+  );
+
+  assert.ok(steered.some((p) => p.id.startsWith("engine")), "first remembered taste is served");
+  assert.ok(steered.some((p) => p.id.startsWith("view")), "second remembered taste is served");
+});
+
+test("remembered taste never outweighs a tap in the current batch", () => {
+  const wanted = subject(0, 5, "wanted");
+  const remembered = { liked: [subject(2, 1, "old")[0].embedding!], rejected: [] };
+
+  const steered = selectWithSteering(
+    [...wanted, ...subject(2, 5, "old")],
+    { liked: ["wanted0"], rejected: [] },
+    undefined,
+    remembered,
+  );
+  assert.ok(steered.some((p) => p.id === "wanted0"), "the tap is still honoured");
 });

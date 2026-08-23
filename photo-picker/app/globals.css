@@ -254,3 +254,8 @@ details.card[open] summary {
   gap: 16px;
   align-items: center;
 }
+
+.link-button.inline {
+  display: inline;
+  padding: 0;
+}

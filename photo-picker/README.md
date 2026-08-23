@@ -352,6 +352,58 @@ rejection, being unambiguous, is a straight penalty.
 Steering degrades rather than misbehaves without embeddings: the controls only
 appear when the model ran, and pinning and dropping still work if it did not.
 
+## Known limit: batch size
+
+**Around 175 photos is the practical cap.** 250 was tried on an iPhone and
+nothing happened — the batch never got as far as analysis. Not yet diagnosed,
+and deliberately left alone for now.
+
+What is already ruled out: storage. Originals are no longer persisted at all,
+so a 250-photo batch writes roughly 10 MB of previews, not gigabytes (see
+[Storage](#storage)). The remaining candidates, in rough order of suspicion:
+
+1. **The iOS import step.** Safari transcodes every selected photo from HEIC to
+   JPEG before handing any of them over, with no progress indication, and it
+   scales with the count — 250 photos is a long silence, and it may simply give
+   up. This failure happens before any of this app's code runs.
+2. **Memory.** Two embedding workers each hold a copy of the model, and stage
+   one decodes photos in parallel across a worker per core. A tab that is
+   already near iOS's ceiling has no room left for the picker to stage files.
+3. **Something in the pipeline that is quadratic in batch size.** Duplicate
+   grouping compares each photo against every group, which is fine at 50 and
+   worth measuring at 250.
+
+Distinguishing these needs a device. The obvious first probe is whether 250
+photos behave any differently with the picker's **Format** set to **Current**,
+which skips the transcode entirely.
+
+## Preferences across batches
+
+Steering used to start from nothing every upload. Since the batch cap makes a
+trip several uploads, the app forgot what it had just been taught each time.
+What the user keeps and drops now persists in its own IndexedDB store, which
+survives the batch cleanup that deliberately discards everything else.
+
+Three rules shape it, each with a test:
+
+1. **A remembered dislike demotes; it never excludes.** Dropping one photo of a
+   bathroom must not permanently hide the one with the plaque on the wall. Only
+   an explicit ✕ on a photo in the current batch removes anything outright.
+2. **Tastes are exemplars, not an average.** Liking engine rooms *and* harbour
+   views averages to a direction meaning neither, so affinity is the best match
+   against any remembered photo rather than the mean of them.
+3. **A tap beats a memory.** Remembered relief and current-batch relief do not
+   stack; the larger applies, so an old batch can never outweigh what the user
+   is saying about this one.
+
+Preferences are **visible and one tap from gone** — the review screen says how
+many kept and dropped photos are informing the batch, with a Forget control.
+Silently reshaping results across sessions is the same failure as a wrong
+duplicate merge, and worse for persisting.
+
+Records are kept per batch (10 batches, 20 photos each) so undoing a tap undoes
+what was learned from it rather than leaving it behind.
+
 ## Still not solved: judgement
 
 None of this can tell a striking composition from a well-exposed photo of

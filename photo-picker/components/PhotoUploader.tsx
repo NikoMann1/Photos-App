@@ -247,7 +247,8 @@ export default function PhotoUploader() {
 
       <p className="muted small">
         On iPhone, tap “Choose photos” → Photo Library, then select and tap Add. Photos
-        are analyzed on your device — nothing is uploaded.
+        are analyzed on your device — nothing is uploaded. Keep batches to around 175
+        photos; larger ones have been seen to stall before analysis starts.
       </p>
 
       {!working && (
