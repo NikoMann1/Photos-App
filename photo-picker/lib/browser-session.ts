@@ -29,7 +29,15 @@ const STORE = "sessions";
  * like the photo picker refusing to close.
  */
 
-export type StoredPhoto = PhotoMeta & { file: File };
+/**
+ * A photo as persisted: metadata and a small JPEG preview, never the original.
+ *
+ * Writing originals here is what exhausts the origin's storage — a 500-photo
+ * batch off a phone is well over a gigabyte — and on iOS an exhausted quota
+ * does not raise an error the user can see, it just stops the photo picker
+ * from closing. Previews cost roughly 40 KB each instead.
+ */
+export type StoredPhoto = PhotoMeta & { preview: Blob | null };
 
 /**
  * Everything the scorer worked out about one photo, minus the file itself.
@@ -179,6 +187,29 @@ export async function loadSession(sessionId: string): Promise<BrowserSession | n
   } finally {
     db.close();
   }
+}
+
+/**
+ * Originals for the batch being worked on, held in memory rather than stored.
+ *
+ * A picked file is already held by the browser outside this origin's quota;
+ * copying it into IndexedDB is what consumes the budget. Keeping the reference
+ * costs nothing extra and survives client-side navigation from the upload
+ * screen to the review screen — but not a reload, which is the deliberate
+ * trade: after a reload the grid still renders from previews, and the review
+ * screen says that saving needs the photos picked again.
+ */
+const originals = new Map<string, Map<string, File>>();
+
+export function rememberOriginals(sessionId: string, files: Map<string, File>): void {
+  // Only one batch is worked on at a time; drop any earlier one's references
+  // so the browser can release the files behind them.
+  originals.clear();
+  originals.set(sessionId, files);
+}
+
+export function getOriginals(sessionId: string): Map<string, File> | null {
+  return originals.get(sessionId) ?? null;
 }
 
 /** Storage can be unavailable — private browsing, or a locked-down WebView. */

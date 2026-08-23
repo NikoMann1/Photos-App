@@ -58,6 +58,65 @@ export function fitWithin(
   };
 }
 
+/**
+ * Previews are the analysis canvas re-encoded, so their longest edge is
+ * ANALYSIS_SIZE. Deliberately no separate size constant: it would either be
+ * ignored or force a second redraw for no benefit. At 512px a preview is tens
+ * of kilobytes and still fills a grid tile on a dense phone screen.
+ */
+const PREVIEW_QUALITY = 0.72;
+
+/**
+ * Encodes what is already on the canvas, so a preview costs one JPEG encode
+ * rather than a second decode of the original.
+ */
+async function encode(canvas: OffscreenCanvas | HTMLCanvasElement): Promise<Blob | null> {
+  try {
+    if ("convertToBlob" in canvas) {
+      return await canvas.convertToBlob({ type: "image/jpeg", quality: PREVIEW_QUALITY });
+    }
+    return await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), "image/jpeg", PREVIEW_QUALITY);
+    });
+  } catch {
+    return null;
+  }
+}
+
+export type Decoded = { pixels: Pixels; preview: Blob | null };
+
+/**
+ * Decodes once and returns both the pixels the metrics need and a small JPEG
+ * for storage.
+ *
+ * The preview exists because the originals cannot be stored: a 500-photo batch
+ * off a phone is well over a gigabyte, far past what iOS grants a website, and
+ * exceeding that quota does not surface as an error — the photo picker simply
+ * stops closing. Originals stay in memory for the session instead.
+ */
+export async function decodeWithPreview(
+  blob: Blob,
+  maxSize: number = ANALYSIS_SIZE,
+): Promise<Decoded> {
+  const bitmap = await createImageBitmap(blob);
+
+  try {
+    const { width, height } = fitWithin(bitmap.width, bitmap.height, maxSize);
+    const surface = createCanvas(width, height);
+    if (!surface) throw new Error("No 2D canvas available for decoding");
+
+    surface.context.drawImage(bitmap, 0, 0, width, height);
+    const imageData = surface.context.getImageData(0, 0, width, height);
+    const pixels = { data: imageData.data, width, height };
+
+    // Same canvas, re-encoded: a preview costs one JPEG encode, no redraw.
+    const preview = await encode(surface.canvas);
+    return { pixels, preview };
+  } finally {
+    bitmap.close();
+  }
+}
+
 export async function decodeToPixels(
   blob: Blob,
   maxSize: number = ANALYSIS_SIZE,
