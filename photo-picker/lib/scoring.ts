@@ -586,6 +586,99 @@ export function selectWithSteering(
 }
 
 // ---------------------------------------------------------------------------
+// Explaining a pick
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a photo ended up in the selection.
+ *
+ * The score alone stopped explaining anything several changes ago: on a real
+ * batch every surviving photo lands between 0.85 and 0.96, and the actual
+ * decision is made by duplicate collapsing, subject diversity and the user's
+ * own taps. Showing the number implies a ranking that is not the one doing the
+ * choosing.
+ */
+export type PickReason =
+  | "kept"
+  | "best-of-similar"
+  | "like-your-picks"
+  | "top-quality"
+  | "different-subject";
+
+export const REASON_LABELS: Record<PickReason, string> = {
+  kept: "you kept this",
+  "best-of-similar": "best of similar",
+  "like-your-picks": "like your picks",
+  "top-quality": "top quality",
+  "different-subject": "different subject",
+};
+
+/** Above this, a photo is close enough to something already chosen that its
+ *  place is owed to quality rather than to covering new ground. */
+const NOVEL_ENOUGH = 0.45;
+
+/** Matching remembered taste this closely is worth saying out loud. */
+const CLEARLY_REMEMBERED = 0.55;
+
+export type ExplainContext = {
+  steering: Steering;
+  remembered: RememberedTaste;
+  /** Photo id to how many near-duplicates it beat. */
+  alternates: Map<string, number>;
+};
+
+/**
+ * Reasons for each pick, in the order they were chosen.
+ *
+ * Ordered by what a person would find most informative, not by what the
+ * algorithm weighted most: an explicit tap first, then that this photo stood in
+ * for several near-identical ones, then remembered taste, then whether it is
+ * here for quality or for coverage.
+ */
+export function explainPicks(
+  picks: ScoredPhoto[],
+  context: ExplainContext,
+): Map<string, PickReason> {
+  const liked = new Set(context.steering.liked);
+  const reasons = new Map<string, PickReason>();
+  const chosen: ScoredPhoto[] = [];
+
+  picks.forEach((photo, index) => {
+    const alternates = context.alternates.get(photo.id) ?? 0;
+    let novelty = 1;
+    for (const already of chosen) {
+      novelty = Math.min(novelty, 1 - similarity(photo, already));
+    }
+
+    let reason: PickReason;
+    if (liked.has(photo.id)) {
+      reason = "kept";
+    } else if (alternates > 0) {
+      reason = "best-of-similar";
+    } else if (nearestAffinity(photo, context.remembered.liked) >= CLEARLY_REMEMBERED) {
+      reason = "like-your-picks";
+    } else if (index === 0 || novelty < NOVEL_ENOUGH) {
+      reason = "top-quality";
+    } else {
+      reason = "different-subject";
+    }
+
+    reasons.set(photo.id, reason);
+    chosen.push(photo);
+  });
+
+  return reasons;
+}
+
+/** The label as shown, with the count folded in where there is one. */
+export function reasonLabel(reason: PickReason, alternates: number): string {
+  if (reason === "best-of-similar" && alternates > 0) {
+    return `best of ${alternates + 1}`;
+  }
+  return REASON_LABELS[reason];
+}
+
+// ---------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------
 

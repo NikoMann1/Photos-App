@@ -412,28 +412,44 @@ Two things also came off the critical path:
 
 ## Known limit: batch size
 
-**Around 175 photos is the practical cap.** 250 was tried on an iPhone and
-nothing happened — the batch never got as far as analysis. Not yet diagnosed,
-and deliberately left alone for now.
+**Around 175 photos is the practical cap. 250 crashes.**
 
-What is already ruled out: storage. Originals are no longer persisted at all,
-so a 250-photo batch writes roughly 10 MB of previews, not gigabytes (see
-[Storage](#storage)). The remaining candidates, in rough order of suspicion:
+The failure is now pinned down: at 250 the page is discarded during the
+*embedding* stage, not before analysis as first assumed. That is memory, and it
+is the same cause as the smaller failures already fixed — a stage that holds
+the model, the runtime's heap and a full-resolution decode at once. The
+concurrency cuts made 120 reliable; 250 still exceeds it.
 
-1. **The iOS import step.** Safari transcodes every selected photo from HEIC to
-   JPEG before handing any of them over, with no progress indication, and it
-   scales with the count — 250 photos is a long silence, and it may simply give
-   up. This failure happens before any of this app's code runs.
-2. **Memory.** Two embedding workers each hold a copy of the model, and stage
-   one decodes photos in parallel across a worker per core. A tab that is
-   already near iOS's ceiling has no room left for the picker to stage files.
-3. **Something in the pipeline that is quadratic in batch size.** Duplicate
-   grouping compares each photo against every group, which is fine at 50 and
-   worth measuring at 250.
+Left alone for now, by choice. The app at least says so: a batch that starts
+and never finishes leaves a marker, so the next visit explains that the phone
+stopped the page rather than showing a bare form.
 
-Distinguishing these needs a device. The obvious first probe is whether 250
-photos behave any differently with the picker's **Format** set to **Current**,
-which skips the transcode entirely.
+Ruled out: **storage** (originals are no longer persisted, so a 250-photo batch
+writes ~10 MB of previews) and **the iOS import step** (the crash happens well
+after import, during embedding).
+
+What is left is peak memory in the embedding stage, and the next lever is
+decoding at reduced resolution so a worker never holds a ~48 MB full-resolution
+bitmap. That wants care rather than enthusiasm: decoding smaller is itself a
+blur, and the focus thresholds in `scoring.ts` were calibrated at 512px, so the
+blur measurements would have to be re-checked against the new size before
+trusting anything the scorer says.
+
+## Saying why a photo was picked
+
+The review screen shows a reason per photo rather than a score.
+
+The score stopped explaining anything several changes ago: on a real batch every
+survivor lands between 0.85 and 0.96, while the decision is actually made by
+duplicate collapsing, subject diversity and the user's own taps. A number that
+tight implies a ranking that is not the one doing the choosing — and the user
+judges every future scoring change by whatever the tile says.
+
+Reasons are ordered by what a person would find informative, not by what the
+algorithm weighted most: an explicit tap first ("you kept this"), then standing
+in for near-duplicates ("best of 4"), then remembered taste ("like your picks"),
+then whether the photo is here on merit ("top quality") or to cover new ground
+("different subject").
 
 ## Preferences across batches
 

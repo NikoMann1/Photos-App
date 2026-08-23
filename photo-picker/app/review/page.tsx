@@ -14,7 +14,13 @@ import {
   type BrowserSession,
   type StoredScore,
 } from "@/lib/browser-session";
-import { selectWithSteering, type ScoredPhoto, type Steering } from "@/lib/scoring";
+import {
+  explainPicks,
+  reasonLabel,
+  selectWithSteering,
+  type ScoredPhoto,
+  type Steering,
+} from "@/lib/scoring";
 import {
   countRemembered,
   exemplars,
@@ -48,6 +54,8 @@ type Loaded = {
   types: Map<string, string>;
   scored: StoredScore[];
   pool: StoredScore[];
+  /** Photo id to how many near-duplicates it beat. */
+  alternates: Map<string, number>;
   summary: Summary;
 };
 
@@ -58,7 +66,7 @@ function Review() {
   const [state, setState] = useState<State>({ phase: "loading" });
   const [steering, setSteering] = useState<Steering>({ liked: [], rejected: [] });
   const [preferences, setPreferences] = useState<Preferences>(NO_PREFERENCES);
-  const [showScores, setShowScores] = useState(false);
+  const [showWhy, setShowWhy] = useState(false);
 
   useEffect(() => {
     if (!sessionId) {
@@ -123,6 +131,9 @@ function Review() {
           types,
           scored: session.scores,
           pool: pool.length > 0 ? pool : session.scores,
+          alternates: new Map(
+            session.duplicateGroups.map((group) => [group.bestId, group.alternateIds.length]),
+          ),
           summary: {
             total: session.totalPhotos ?? session.photos.length,
             rejectedCount: session.rejectedCount,
@@ -254,7 +265,7 @@ function Review() {
     );
   }
 
-  const { summary, urls, files, names, types } = state.data;
+  const { summary, urls, files, names, types, alternates } = state.data;
   const rememberedCount = countRemembered({
     batches: preferences.batches.filter((batch) => batch.sessionId !== state.data.sessionId),
   });
@@ -273,12 +284,19 @@ function Review() {
     url: urls.get(photo.id)!,
   }));
 
+  // Why each photo is here, rather than a score: on a real batch every
+  // survivor lands within a few hundredths, and the number describes a signal
+  // that stopped being the deciding one several changes ago.
+  const reasons = explainPicks(shown, { steering, remembered, alternates });
+
   const gridPhotos = shown.map((photo) => ({
     id: photo.id,
     name: names.get(photo.id) ?? photo.id,
     url: urls.get(photo.id)!,
-    badge: showScores ? photo.score.toFixed(2) : undefined,
-    note: showScores ? photo.rejectedFor : null,
+    badge: showWhy
+      ? reasonLabel(reasons.get(photo.id) ?? "top-quality", alternates.get(photo.id) ?? 0)
+      : undefined,
+    note: showWhy ? photo.rejectedFor : null,
     liked: likedIds.has(photo.id),
     onLike: summary.steerable ? () => steer(photo.id, "like") : undefined,
     onReject: summary.steerable ? () => steer(photo.id, "reject") : undefined,
@@ -336,9 +354,9 @@ function Review() {
         <button
           type="button"
           className="link-button small"
-          onClick={() => setShowScores((shown) => !shown)}
+          onClick={() => setShowWhy((on) => !on)}
         >
-          {showScores ? "Hide scores" : "Show scores"}
+          {showWhy ? "Hide reasons" : "Why these?"}
         </button>
         {(steering.liked.length > 0 || steering.rejected.length > 0) && (
           <button
