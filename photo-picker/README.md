@@ -377,6 +377,33 @@ Distinguishing these needs a device. The obvious first probe is whether 250
 photos behave any differently with the picker's **Format** set to **Current**,
 which skips the transcode entirely.
 
+## Preferences across batches
+
+Steering used to start from nothing every upload. Since the batch cap makes a
+trip several uploads, the app forgot what it had just been taught each time.
+What the user keeps and drops now persists in its own IndexedDB store, which
+survives the batch cleanup that deliberately discards everything else.
+
+Three rules shape it, each with a test:
+
+1. **A remembered dislike demotes; it never excludes.** Dropping one photo of a
+   bathroom must not permanently hide the one with the plaque on the wall. Only
+   an explicit ✕ on a photo in the current batch removes anything outright.
+2. **Tastes are exemplars, not an average.** Liking engine rooms *and* harbour
+   views averages to a direction meaning neither, so affinity is the best match
+   against any remembered photo rather than the mean of them.
+3. **A tap beats a memory.** Remembered relief and current-batch relief do not
+   stack; the larger applies, so an old batch can never outweigh what the user
+   is saying about this one.
+
+Preferences are **visible and one tap from gone** — the review screen says how
+many kept and dropped photos are informing the batch, with a Forget control.
+Silently reshaping results across sessions is the same failure as a wrong
+duplicate merge, and worse for persisting.
+
+Records are kept per batch (10 batches, 20 photos each) so undoing a tap undoes
+what was learned from it rather than leaving it behind.
+
 ## Still not solved: judgement
 
 None of this can tell a striking composition from a well-exposed photo of

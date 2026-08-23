@@ -448,6 +448,14 @@ export function selectDiverse(
  */
 export type Steering = { liked: string[]; rejected: string[] };
 
+/**
+ * What earlier batches taught the app, as embeddings rather than ids — the
+ * photos themselves are long gone.
+ */
+export type RememberedTaste = { liked: Float32Array[]; rejected: Float32Array[] };
+
+export const NO_TASTE: RememberedTaste = { liked: [], rejected: [] };
+
 export const NO_STEERING: Steering = { liked: [], rejected: [] };
 
 /**
@@ -455,6 +463,18 @@ export const NO_STEERING: Steering = { liked: [], rejected: [] };
  * than the ~0.04 spread of the technical score across a real batch.
  */
 const REJECT_WEIGHT = 0.5;
+
+/**
+ * Remembered taste pulls more gently than a tap in the current batch, and a
+ * remembered dislike *demotes* rather than excludes.
+ *
+ * Dropping one photo of a bathroom must not permanently hide the one with the
+ * plaque on the wall: only an explicit ✕ on the photo in front of the user
+ * removes anything. Weaker weights also keep an old batch from overwhelming
+ * what the user is saying about this one.
+ */
+const REMEMBERED_LIKE_RELIEF = 0.3;
+const REMEMBERED_REJECT_WEIGHT = 0.2;
 
 /**
  * A like is *not* modelled as a bonus, because a bonus fights the novelty
@@ -479,6 +499,19 @@ const LIKE_RELIEF = 0.5;
 function contentAffinity(photo: ScoredPhoto, reference: Float32Array | null): number {
   if (!photo.embedding || !reference) return 0;
   return Math.max(0, Math.min(1, (embeddingSimilarity(photo.embedding, reference) - 0.19) / 0.81));
+}
+
+/**
+ * Closeness to the nearest of several references. Max rather than mean: liking
+ * engine rooms and harbour views averages to a direction meaning neither, so
+ * unrelated tastes have to be kept apart.
+ */
+function nearestAffinity(photo: ScoredPhoto, references: Float32Array[]): number {
+  let best = 0;
+  for (const reference of references) {
+    best = Math.max(best, contentAffinity(photo, reference));
+  }
+  return best;
 }
 
 /** Mean direction of a set of embeddings, renormalised to unit length. */
@@ -518,6 +551,7 @@ export function selectWithSteering(
   candidates: ScoredPhoto[],
   steering: Steering,
   ratio: number = SELECTION_RATIO,
+  remembered: RememberedTaste = NO_TASTE,
 ): ScoredPhoto[] {
   const liked = new Set(steering.liked);
   const rejected = new Set(steering.rejected);
@@ -534,11 +568,19 @@ export function selectWithSteering(
     for (const reject of rejectedPhotos) {
       unwanted = Math.max(unwanted, contentAffinity(photo, reject.embedding ?? null));
     }
-    return photo.score - REJECT_WEIGHT * unwanted;
+    const remembersDislike = nearestAffinity(photo, remembered.rejected);
+    return (
+      photo.score - REJECT_WEIGHT * unwanted - REMEMBERED_REJECT_WEIGHT * remembersDislike
+    );
   };
 
-  const noveltyDiscount = (photo: ScoredPhoto) =>
-    1 - LIKE_RELIEF * contentAffinity(photo, likedDirection);
+  const noveltyDiscount = (photo: ScoredPhoto) => {
+    const asked = contentAffinity(photo, likedDirection);
+    const remembers = nearestAffinity(photo, remembered.liked);
+    // Whichever relief is larger applies; they do not stack, so remembered
+    // taste can never make repetition cheaper than an explicit tap does.
+    return 1 - Math.max(LIKE_RELIEF * asked, REMEMBERED_LIKE_RELIEF * remembers);
+  };
 
   return selectDiverse(pool, wanted, seeds, valueOf, noveltyDiscount);
 }

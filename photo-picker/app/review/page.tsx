@@ -13,6 +13,15 @@ import {
   type StoredScore,
 } from "@/lib/browser-session";
 import { selectWithSteering, type ScoredPhoto, type Steering } from "@/lib/scoring";
+import {
+  countRemembered,
+  exemplars,
+  forgetPreferences,
+  loadPreferences,
+  rememberBatch,
+  NO_PREFERENCES,
+  type Preferences,
+} from "@/lib/preferences";
 
 type Summary = {
   total: number;
@@ -46,6 +55,7 @@ function Review() {
   const sessionId = useSearchParams().get("session");
   const [state, setState] = useState<State>({ phase: "loading" });
   const [steering, setSteering] = useState<Steering>({ liked: [], rejected: [] });
+  const [preferences, setPreferences] = useState<Preferences>(NO_PREFERENCES);
   const [showScores, setShowScores] = useState(false);
 
   useEffect(() => {
@@ -92,6 +102,7 @@ function Review() {
       );
 
       setSteering(session.steering ?? { liked: [], rejected: [] });
+      setPreferences(await loadPreferences());
       setState({
         phase: "ready",
         data: {
@@ -131,10 +142,24 @@ function Review() {
 
   // Re-choose locally on every tap: the expensive analysis already ran, so
   // this is a few thousand dot products, not another pass over the photos.
+  // Only earlier batches inform this one: this batch's own taps are already
+  // applied directly, and counting them twice would double their weight.
+  const remembered = useMemo(() => {
+    const others: Preferences = {
+      batches: preferences.batches.filter((batch) => batch.sessionId !== data?.sessionId),
+    };
+    return { liked: exemplars(others, "liked"), rejected: exemplars(others, "rejected") };
+  }, [preferences, data]);
+
   const selected = useMemo(() => {
     if (!data) return [];
-    return selectWithSteering(data.pool as unknown as ScoredPhoto[], steering);
-  }, [data, steering]);
+    return selectWithSteering(
+      data.pool as unknown as ScoredPhoto[],
+      steering,
+      undefined,
+      remembered,
+    );
+  }, [data, steering, remembered]);
 
   useEffect(() => {
     if (!data || selected.length === 0) return;
@@ -143,6 +168,19 @@ function Review() {
       steering,
       selected.map((photo) => photo.id),
     );
+
+    // Teach the next batch what this one was told, keyed by session so undoing
+    // a tap undoes what was learned from it.
+    const embeddingOf = (id: string) =>
+      data.scored.find((photo) => photo.id === id)?.embedding ?? null;
+    const collect = (ids: string[]) =>
+      ids.map(embeddingOf).filter((e): e is Float32Array => e != null);
+
+    void rememberBatch(
+      data.sessionId,
+      collect(steering.liked),
+      collect(steering.rejected),
+    ).then(setPreferences);
   }, [data, steering, selected]);
 
   const steer = useCallback((id: string, action: "like" | "reject") => {
@@ -184,6 +222,9 @@ function Review() {
   }
 
   const { summary, urls, files, names, types } = state.data;
+  const rememberedCount = countRemembered({
+    batches: preferences.batches.filter((batch) => batch.sessionId !== state.data.sessionId),
+  });
   const likedIds = new Set(steering.liked);
 
   // The grid renders from whatever is available; only photos with an original
@@ -241,6 +282,20 @@ function Review() {
           Tap <strong>♥</strong> to keep a photo and get more like it, <strong>✕</strong> to
           drop it and photos like it. The rest re-shuffle around your choices.
           {steering.rejected.length > 0 && ` ${steering.rejected.length} dropped.`}
+        </p>
+      )}
+
+      {rememberedCount.liked + rememberedCount.rejected > 0 && (
+        <p className="muted small">
+          Also using {rememberedCount.liked} kept and {rememberedCount.rejected} dropped
+          from earlier batches.{" "}
+          <button
+            type="button"
+            className="link-button small inline"
+            onClick={() => void forgetPreferences().then(setPreferences)}
+          >
+            Forget
+          </button>
         </p>
       )}
 

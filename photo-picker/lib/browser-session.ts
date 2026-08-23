@@ -16,8 +16,15 @@
 import type { PhotoMeta, ScoredPhoto, Steering } from "./scoring";
 
 const DB_NAME = "photo-picker";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE = "sessions";
+
+/**
+ * Preferences live in their own store because batches are deliberately
+ * disposable — only the newest is kept — and what the user has taught the app
+ * must outlive them.
+ */
+export const PREFERENCES_STORE = "preferences";
 
 /**
  * Only the newest batch is kept.
@@ -87,6 +94,9 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "sessionId" });
       }
+      if (!db.objectStoreNames.contains(PREFERENCES_STORE)) {
+        db.createObjectStore(PREFERENCES_STORE);
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("Could not open IndexedDB"));
@@ -98,6 +108,15 @@ function promisify<T>(request: IDBRequest<T>): Promise<T> {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed"));
   });
+}
+
+/** Shared with `preferences.ts`, which stores into the same database. */
+export function openDatabase(): Promise<IDBDatabase> {
+  return openDb();
+}
+
+export function toPromise<T>(request: IDBRequest<T>): Promise<T> {
+  return promisify(request);
 }
 
 /** Records a steering change without rewriting the photos themselves. */
