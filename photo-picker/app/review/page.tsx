@@ -351,6 +351,14 @@ function Review() {
         )}
       </div>
 
+      {shown.length > saveable.length && saveable.length > 0 && (
+        <p className="muted small">
+          {shown.length - saveable.length} of these can’t be saved: they came into the
+          selection after the page reloaded, and the full-quality photos behind them are
+          no longer on the device. Pick the batch again to save everything.
+        </p>
+      )}
+
       {summary.canSave ? (
         <SaveToPhotosButton photos={sharePhotos} />
       ) : (

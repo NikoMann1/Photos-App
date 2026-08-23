@@ -26,14 +26,19 @@ export type AnalysisResult = {
 export type ProgressHandler = (done: number, total: number) => void;
 
 /**
- * Workers are a win up to a point; beyond it they contend for memory, and a
- * 12 MP decode in flight is ~48 MB apiece — enough for iOS to kill the tab.
+ * Concurrency is bounded by memory, not by cores.
  *
- * All cores rather than cores-1: during analysis the main thread only receives
- * messages, so holding a core back just leaves it idle. Safari reports 4 here
- * even on phones with more, which is the real ceiling in practice.
+ * Every worker decoding a photo holds a full-resolution bitmap — ~48 MB for a
+ * 12 MP iPhone photo — so four in flight is nearly 200 MB of transient image
+ * data on top of everything else. iOS answers that by killing the tab, and the
+ * user sees the upload reset to "Choose photos" halfway through with no
+ * explanation.
+ *
+ * Measured earlier, the fourth worker bought about 1% (1312ms against 1296ms
+ * over a batch), so the parallelism being given up here is worth very little
+ * and the memory it costs is worth a great deal.
  */
-const MAX_WORKERS = 6;
+const MAX_WORKERS = 3;
 
 function workerCount(taskCount: number): number {
   const cores =
@@ -190,11 +195,16 @@ async function analyzeOnMainThread(file: File): Promise<MetricsResult> {
 // ---------------------------------------------------------------------------
 
 /**
- * Fewer workers than stage one: each holds its own copy of the model, and
- * memory is the binding constraint on a phone, not cores. Inference is also
- * single-threaded per session by design (measured thread scaling was nil).
+ * One worker, deliberately.
+ *
+ * This stage is the memory peak of the whole app: each worker holds its own
+ * copy of the model plus the runtime's WASM heap, *and* a full-resolution
+ * decode while it works. Two of those was enough for iOS to discard the tab
+ * mid-batch. Inference is single-threaded per session anyway (measured thread
+ * scaling was nil), so the second worker only ever bought overlap, and it
+ * bought it at the price of the batch surviving at all.
  */
-const MAX_EMBED_WORKERS = 2;
+const MAX_EMBED_WORKERS = 1;
 
 export type EmbeddingResult = { id: string; embedding: Float32Array | null; error?: string };
 

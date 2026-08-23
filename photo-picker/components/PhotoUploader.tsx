@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   NO_STEERING,
@@ -52,10 +52,53 @@ const LOOKING = "Looking at";
  */
 const FINISHING = "Finishing";
 
+/**
+ * A batch that started but never finished almost certainly means iOS discarded
+ * the tab to reclaim memory — the page simply reloads and the user is back at
+ * "Choose photos" with no idea why. localStorage rather than IndexedDB because
+ * it is synchronous: the marker has to be written before the heavy work, not
+ * queued behind it.
+ */
+const IN_PROGRESS_KEY = "photo-picker:batch-in-progress";
+
+function markBatchStarted(count: number): void {
+  try {
+    localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify({ count, startedAt: Date.now() }));
+  } catch {
+    // Private browsing: the warning is a nicety, not a requirement.
+  }
+}
+
+function clearBatchMarker(): void {
+  try {
+    localStorage.removeItem(IN_PROGRESS_KEY);
+  } catch {
+    // Ignore.
+  }
+}
+
+/** Reads and clears any marker left behind by a batch that never finished. */
+function takeInterruptedBatch(): number | null {
+  try {
+    const raw = localStorage.getItem(IN_PROGRESS_KEY);
+    if (!raw) return null;
+    localStorage.removeItem(IN_PROGRESS_KEY);
+    const parsed = JSON.parse(raw) as { count?: unknown };
+    return typeof parsed.count === "number" ? parsed.count : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function PhotoUploader() {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<Status>({ phase: "idle" });
+  const [interrupted, setInterrupted] = useState<number | null>(null);
+
+  useEffect(() => {
+    setInterrupted(takeInterruptedBatch());
+  }, []);
 
   async function handleFiles(fileList: FileList | null) {
     const files = Array.from(fileList ?? []);
@@ -70,6 +113,8 @@ export default function PhotoUploader() {
     }
 
     const sessionId = newSessionId();
+    setInterrupted(null);
+    markBatchStarted(files.length);
 
     try {
       if (UPLOAD_TO_SERVER) {
@@ -221,8 +266,10 @@ export default function PhotoUploader() {
         selectedIds,
       );
 
+      clearBatchMarker();
       router.push(`/review?session=${sessionId}`);
     } catch (error) {
+      clearBatchMarker();
       setStatus({
         phase: "error",
         message: error instanceof Error ? error.message : "Something went wrong",
@@ -277,6 +324,14 @@ export default function PhotoUploader() {
       {status.phase === "error" && (
         <p className="error" role="alert">
           {status.message}
+        </p>
+      )}
+
+      {interrupted !== null && status.phase === "idle" && (
+        <p className="error" role="alert">
+          The last batch of {interrupted} photos didn’t finish. iPhones stop a web page
+          that uses too much memory, and reload it — which looks exactly like this. Try
+          fewer photos at a time.
         </p>
       )}
 

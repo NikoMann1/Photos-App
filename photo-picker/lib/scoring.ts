@@ -649,7 +649,10 @@ export function shortlistForEmbedding(
 ): ScoredPhoto[] {
   const candidates = selection.ranked.filter((photo) => photo.rejectedFor === null);
   const target = selectionSize(candidates.length, ratio);
-  return candidates.slice(0, Math.max(target * 3, Math.min(candidates.length, 20)));
+  // Twice the slots rather than three times: enough competition to make the
+  // choice meaningful, while cutting a third off the app's most expensive and
+  // most memory-hungry stage.
+  return candidates.slice(0, Math.max(target * 2, Math.min(candidates.length, 16)));
 }
 
 /**

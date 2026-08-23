@@ -259,7 +259,30 @@ function originalKey(sessionId: string, photoId: string): string {
  * Called again whenever steering changes what is selected, so the photos the
  * user can actually see are the photos they can actually save.
  */
-export async function storeSelectedOriginals(
+let originalsQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Serialised, because this both deletes and writes.
+ *
+ * Steering fires it on every change, and overlapping calls raced: one call's
+ * cleanup of "everything not currently selected" removed keys another call had
+ * just written, leaving a single original behind and most of the selection
+ * unsaveable after a reload. Chaining makes the last caller win, which is the
+ * one holding the current selection.
+ */
+export function storeSelectedOriginals(
+  sessionId: string,
+  files: Map<string, File>,
+  selectedIds: string[],
+): Promise<void> {
+  const next = originalsQueue.then(() =>
+    writeSelectedOriginals(sessionId, files, selectedIds),
+  );
+  originalsQueue = next.catch(() => undefined);
+  return next;
+}
+
+async function writeSelectedOriginals(
   sessionId: string,
   files: Map<string, File>,
   selectedIds: string[],
@@ -270,19 +293,26 @@ export async function storeSelectedOriginals(
       const tx = db.transaction(ORIGINALS_STORE, "readwrite");
       const store = tx.objectStore(ORIGINALS_STORE);
 
-      // Drop anything not currently selected, including other sessions'.
-      const wanted = new Set(selectedIds.map((id) => originalKey(sessionId, id)));
-      const existing = await promisify<IDBValidKey[]>(store.getAllKeys());
-      for (const key of existing) {
-        if (!wanted.has(String(key))) store.delete(key);
-      }
-
+      // Write first, prune second. The reverse order looked tidier but is not
+      // crash-safe: a reload landing between the delete and the put — which is
+      // exactly what iOS does when it reclaims a tab — leaves storage holding
+      // fewer originals than before, and photos that can be seen but not
+      // saved. This way an interruption leaves extras, which the next run
+      // clears, rather than gaps.
+      const wanted = new Set<string>();
       let budget = ORIGINALS_BUDGET_BYTES;
       for (const id of selectedIds) {
         const file = files.get(id);
         if (!file || file.size > budget) continue;
         budget -= file.size;
-        store.put(file, originalKey(sessionId, id));
+        const key = originalKey(sessionId, id);
+        wanted.add(key);
+        store.put(file, key);
+      }
+
+      const existing = await promisify<IDBValidKey[]>(store.getAllKeys());
+      for (const key of existing) {
+        if (!wanted.has(String(key))) store.delete(key);
       }
 
       await new Promise<void>((resolve) => {

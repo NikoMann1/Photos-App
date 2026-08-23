@@ -361,6 +361,33 @@ rejection, being unambiguous, is a straight penalty.
 Steering degrades rather than misbehaves without embeddings: the controls only
 appear when the model ran, and pinning and dropping still work if it did not.
 
+## Memory, and why concurrency is capped
+
+The app's failure mode on iPhone is not an error message. It is the tab being
+discarded and reloaded: the upload resets to "Choose photos" partway through,
+or the save button vanishes from a screen the user never reloaded. Nothing in
+the console, because the console went with it.
+
+Every worker decoding a photo holds a full-resolution bitmap — ~48 MB for a
+12 MP photo — and every embedding worker holds its own copy of the model plus
+the runtime's WASM heap on top of that. So concurrency is bounded by memory,
+not by cores:
+
+- **Stage one: at most 3 workers.** The fourth was measured at about 1% (1312ms
+  against 1296ms), which is not worth ~48 MB.
+- **Stage two: exactly 1.** This is the memory peak of the whole app. Inference
+  is single-threaded per session anyway, so a second worker only bought
+  overlap — at the price of the batch surviving.
+- **The shortlist is twice the slots, not three times**, cutting a third off
+  the most expensive stage.
+
+Together these made a 120-photo batch *faster* here (10s against 15s), because
+the work removed was worth more than the parallelism given up.
+
+If a batch is interrupted anyway, a marker written before the work and cleared
+after it means the next visit can say so, rather than leaving the user staring
+at a reset form wondering what they did wrong.
+
 ## The finishing phase
 
 Work continues after the last photo is measured — re-choosing with embeddings,
