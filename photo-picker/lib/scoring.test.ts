@@ -14,6 +14,9 @@ import {
   selectWithSteering,
   shortlistForEmbedding,
   similarity,
+  steeredTaste,
+  tasteBias,
+  tasteDirection,
   type AnalyzedPhoto,
   type ScoredPhoto,
 } from "./scoring";
@@ -47,6 +50,8 @@ function metrics(overrides: Partial<ImageMetrics> = {}): ImageMetrics {
     ...overrides,
   };
 }
+
+const NO_STEERING_IDS = { liked: [], rejected: [] };
 
 let nextId = 0;
 function photo(overrides: Partial<ImageMetrics> = {}, extra: Partial<AnalyzedPhoto> = {}): AnalyzedPhoto {
@@ -504,4 +509,131 @@ test("later picks are distinguished by whether they cover new ground", () => {
   assert.equal(reasons.get("a0"), "top-quality", "the first pick is not about coverage");
   assert.equal(reasons.get("a21"), "top-quality", "a near-copy is here on merit, not novelty");
   assert.equal(reasons.get("b0"), "different-subject");
+});
+
+// ---------------------------------------------------------------------------
+// Judgement
+// ---------------------------------------------------------------------------
+
+/** A unit vector with the given weights on the given axes. */
+function vector(weights: Record<number, number>, dims = 512): Float32Array {
+  const v = new Float32Array(dims);
+  for (const [axis, weight] of Object.entries(weights)) v[Number(axis)] = weight;
+  const norm = Math.hypot(...v);
+  for (let i = 0; i < dims; i++) v[i] /= norm;
+  return v;
+}
+
+/** Axis 0 is what kept and dropped photos share; 1 and 2 are what separates them. */
+const SHARED = vector({ 0: 1 });
+const KEPT_SIDE = vector({ 0: 1, 1: 1 });
+const DROPPED_SIDE = vector({ 0: 1, 2: 1 });
+
+function scoredWith(embedding: Float32Array, id: string): ScoredPhoto {
+  return scorePhoto(photo({}, { id, embedding }));
+}
+
+test("judgement waits for both sides before it decides anything", () => {
+  const kept = [KEPT_SIDE, KEPT_SIDE, KEPT_SIDE];
+  const dropped = [DROPPED_SIDE, DROPPED_SIDE, DROPPED_SIDE];
+
+  assert.equal(tasteDirection(kept, []), null, "keeps alone say what you like, not what you don't");
+  assert.equal(tasteDirection([], dropped), null);
+  assert.equal(tasteDirection(kept.slice(0, 2), dropped), null, "two taps is a quirk, not a taste");
+
+  const taste = tasteDirection(kept, dropped);
+  assert.ok(taste, "three of each is enough to learn from");
+  assert.ok(taste!.confidence > 0 && taste!.confidence < 1, "little evidence pulls gently");
+  assert.equal(tasteDirection(
+    Array.from({ length: 20 }, () => KEPT_SIDE),
+    Array.from({ length: 20 }, () => DROPPED_SIDE),
+  )!.confidence, 1, "plenty of evidence pulls at full strength");
+});
+
+test("judgement learns what separates keeps from drops, not what they have in common", () => {
+  const taste = tasteDirection(
+    Array.from({ length: 10 }, () => KEPT_SIDE),
+    Array.from({ length: 10 }, () => DROPPED_SIDE),
+  );
+
+  const likeKeeps = tasteBias(scoredWith(KEPT_SIDE, "keep"), taste);
+  const likeDrops = tasteBias(scoredWith(DROPPED_SIDE, "drop"), taste);
+  const shared = tasteBias(scoredWith(SHARED, "shared"), taste);
+
+  assert.ok(likeKeeps > 0, "a photo on the kept side is promoted");
+  assert.ok(likeDrops < 0, "and one on the dropped side is demoted, not merely ignored");
+  assert.ok(Math.abs(shared) < 1e-6, "what both sides share is no evidence either way");
+
+  // The rule this replaces cannot make that distinction: measured only by
+  // resemblance to a kept photo, the shared subject looks like a keeper.
+  const reasons = explainPicks([scoredWith(SHARED, "shared")], {
+    steering: NO_STEERING_IDS,
+    remembered: { liked: [KEPT_SIDE], rejected: [] },
+    alternates: new Map(),
+  });
+  assert.equal(reasons.get("shared"), "like-your-picks");
+});
+
+test("judgement is inert on photos it cannot see the content of", () => {
+  const taste = tasteDirection(
+    Array.from({ length: 10 }, () => KEPT_SIDE),
+    Array.from({ length: 10 }, () => DROPPED_SIDE),
+  );
+  const blind = scorePhoto(photo({}, { id: "blind", embedding: null }));
+  assert.equal(tasteBias(blind, taste), 0, "not knowing is not evidence against");
+  assert.equal(tasteBias(scoredWith(KEPT_SIDE, "sighted"), null), 0);
+});
+
+test("this batch's taps sharpen judgement on this batch, not only the next one", () => {
+  const candidates = [
+    ...Array.from({ length: 3 }, (_, i) => scoredWith(KEPT_SIDE, `keep${i}`)),
+    ...Array.from({ length: 3 }, (_, i) => scoredWith(DROPPED_SIDE, `drop${i}`)),
+    scoredWith(SHARED, "other"),
+  ];
+  const steering = {
+    liked: ["keep0", "keep1", "keep2"],
+    rejected: ["drop0", "drop1", "drop2"],
+  };
+
+  assert.equal(steeredTaste(candidates, NO_STEERING_IDS), null, "nothing said, nothing learned");
+  assert.ok(steeredTaste(candidates, steering), "taps in the current batch count as evidence");
+});
+
+test("a strong opinion still leaves room for other subjects", () => {
+  // The failure this guards against: a learned preference that wins
+  // photo-for-photo against novelty returns a screenful of the same thing.
+  const favourite = Array.from({ length: 8 }, (_, i) => scoredWith(KEPT_SIDE, `fav${i}`));
+  const others = [
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(vector({ 3: 1 }), `x${i}`)),
+    ...Array.from({ length: 4 }, (_, i) => scoredWith(vector({ 4: 1 }), `y${i}`)),
+  ];
+  const remembered = {
+    liked: Array.from({ length: 20 }, () => KEPT_SIDE),
+    rejected: Array.from({ length: 20 }, () => DROPPED_SIDE),
+  };
+
+  const picked = selectWithSteering([...favourite, ...others], NO_STEERING_IDS, undefined, remembered);
+  const favourites = picked.filter((p) => p.id.startsWith("fav")).length;
+
+  assert.ok(favourites >= 1, "the subject the user keeps must be represented");
+  assert.ok(
+    favourites < picked.length,
+    `judgement crowded out every other subject: ${picked.map((p) => p.id).join(", ")}`,
+  );
+});
+
+test("judgement can say why, once it has learned enough to be worth saying", () => {
+  const taste = tasteDirection(
+    Array.from({ length: 10 }, () => KEPT_SIDE),
+    Array.from({ length: 10 }, () => DROPPED_SIDE),
+  );
+  const reasons = explainPicks([scoredWith(KEPT_SIDE, "yours"), scoredWith(DROPPED_SIDE, "not")], {
+    steering: NO_STEERING_IDS,
+    remembered: NO_TASTE,
+    alternates: new Map(),
+    taste,
+  });
+
+  assert.equal(reasons.get("yours"), "like-your-picks");
+  assert.notEqual(reasons.get("not"), "like-your-picks", "the other side is never claimed as taste");
 });

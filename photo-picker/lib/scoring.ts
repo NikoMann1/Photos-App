@@ -1,11 +1,13 @@
 /**
  * Photo scoring and selection.
  *
- * Scoring is *measured*, not learned: focus, exposure, tonal range and colour,
+ * The score is *measured*, not learned: focus, exposure, tonal range and colour,
  * computed from the pixels in `lib/analysis/metrics.ts`. That reliably answers
  * "is this photo technically botched?" — blurred, out of focus, badly clipped.
- * It does not answer "is this a good photograph?", which needs a learned
- * aesthetic model; see NOT-YET-SOLVED at the bottom of this file.
+ * It does not answer "was this photo worth taking?", which is a matter of
+ * taste; the taste direction further down learns that from the user's own ♥
+ * and ✕ taps rather than trying to measure it. See NOT-YET-SOLVED at the
+ * bottom of this file for what neither of them covers.
  *
  * Selection therefore has three stages, in this order:
  *   1. collapse near-duplicates, keeping the best frame of each burst
@@ -515,24 +517,182 @@ function nearestAffinity(photo: ScoredPhoto, references: Float32Array[]): number
 }
 
 /** Mean direction of a set of embeddings, renormalised to unit length. */
-function meanEmbedding(photos: ScoredPhoto[]): Float32Array | null {
-  const withEmbedding = photos.filter((photo) => photo.embedding);
-  if (withEmbedding.length === 0) return null;
+function meanOf(vectors: Float32Array[]): Float32Array | null {
+  const usable = vectors.filter((vector) => vector.length === vectors[0]?.length);
+  if (usable.length === 0) return null;
 
-  const dims = withEmbedding[0].embedding!.length;
+  const dims = usable[0].length;
   const sum = new Float32Array(dims);
-  for (const photo of withEmbedding) {
-    const embedding = photo.embedding!;
-    for (let i = 0; i < dims; i++) sum[i] += embedding[i];
+  for (const vector of usable) {
+    for (let i = 0; i < dims; i++) sum[i] += vector[i];
   }
+  return normalized(sum);
+}
 
+/** The same vector scaled to unit length, or null if it has no direction. */
+function normalized(vector: Float32Array): Float32Array | null {
   let norm = 0;
-  for (const v of sum) norm += v * v;
+  for (const v of vector) norm += v * v;
   norm = Math.sqrt(norm);
   if (norm === 0) return null;
 
-  for (let i = 0; i < dims; i++) sum[i] /= norm;
-  return sum;
+  const unit = new Float32Array(vector.length);
+  for (let i = 0; i < vector.length; i++) unit[i] = vector[i] / norm;
+  return unit;
+}
+
+function meanEmbedding(photos: ScoredPhoto[]): Float32Array | null {
+  return meanOf(embeddingsOf(photos));
+}
+
+function embeddingsOf(photos: ScoredPhoto[]): Float32Array[] {
+  return photos.flatMap((photo) => (photo.embedding ? [photo.embedding] : []));
+}
+
+// ---------------------------------------------------------------------------
+// Judgement: was this photo worth taking?
+// ---------------------------------------------------------------------------
+
+/**
+ * The axis separating photos the user keeps from photos they drop.
+ *
+ * Everything else in this file answers "is this photo botched?" or "have I
+ * already got one like it?". Neither answers whether the photo was worth
+ * taking, and a universal answer is not affordable here: the aesthetic models
+ * that do it well want a CLIP ViT-L/14 tower (~300 MB) against our 21 MB
+ * MobileCLIP, on a phone where memory pressure already costs us batches, and
+ * zero-shot prompting for it was measured and rejected — "a beautiful
+ * photograph" ranked floor grating above a harbour view.
+ *
+ * So judgement here is *personal*, learned from the ♥ and ✕ taps the app
+ * already collects. `mean(kept) - mean(dropped)` is the direction along which
+ * those two sets differ; a photo's projection onto it is how much it looks
+ * like the ones kept rather than the ones dropped.
+ *
+ * This is a genuinely different question from `nearestAffinity`, which asks
+ * only "does this resemble something you kept". That cannot learn a
+ * *distinction*: a bunkroom shot resembles both a kept bunk photo and a
+ * dropped one, so it scores high either way. On the user's own photos, trained
+ * on two kept and two dropped and evaluated on six held out, the direction
+ * ordered them +0.384 to -0.105 while nearest-exemplar ranked a near-miss
+ * third; the two rankings disagree, and only this one has a sign.
+ */
+export type TasteDirection = {
+  /** Unit-length; project an embedding onto it to judge that photo. */
+  vector: Float32Array;
+  /** 0..1, how much evidence it was learned from. Scales its influence. */
+  confidence: number;
+};
+
+/**
+ * Both sides are required, and at fewer than this many of either the direction
+ * is one photo's quirks rather than a taste. Two-vs-two already produced a
+ * sensible held-out ordering, so three is not a high bar — it is a guard
+ * against learning a whole trip's ranking from a single stray tap.
+ */
+const TASTE_MIN_LABELS = 3;
+
+/** Where the evidence stops growing the direction's influence. */
+const TASTE_CONFIDENT = 10;
+
+/**
+ * The projection magnitude that counts as a full-strength opinion. Measured:
+ * across the user's own photos, projections onto a direction trained on four
+ * of them spanned -0.486 to +0.425, so ~0.45 is the edge of the range rather
+ * than a round number.
+ */
+const TASTE_SCALE = 0.45;
+
+/**
+ * How much a full-strength opinion moves a photo's ranking value.
+ *
+ * Sized against the two things it competes with. Against the technical score,
+ * whose spread across a real batch is about 0.04, a full swing of 0.24 means
+ * judgement decides the order among photos that are all technically fine —
+ * which is the point. Against the diversity penalty (at most 0.15), a photo
+ * has to beat another by 0.63 of the entire observed taste range before it
+ * displaces a subject not yet covered. Taste can override coverage, but only
+ * on a strong opinion, never on a marginal one.
+ *
+ * That asymmetry is deliberate. The last time a learned preference was allowed
+ * to win photo-for-photo against novelty it collapsed the selection into five
+ * near-copies; the ceiling here is what stops that repeating.
+ */
+const TASTE_WEIGHT = 0.12;
+
+/**
+ * Learns the direction, or returns null when there is not enough to learn from.
+ */
+export function tasteDirection(
+  kept: Float32Array[],
+  dropped: Float32Array[],
+): TasteDirection | null {
+  const labels = Math.min(kept.length, dropped.length);
+  if (labels < TASTE_MIN_LABELS) return null;
+
+  const keptMean = meanOf(kept);
+  const droppedMean = meanOf(dropped);
+  if (!keptMean || !droppedMean || keptMean.length !== droppedMean.length) return null;
+
+  const difference = new Float32Array(keptMean.length);
+  for (let i = 0; i < difference.length; i++) difference[i] = keptMean[i] - droppedMean[i];
+
+  const vector = normalized(difference);
+  if (!vector) return null;
+
+  return { vector, confidence: Math.min(1, labels / TASTE_CONFIDENT) };
+}
+
+/**
+ * What the current batch and every remembered one together say about taste.
+ *
+ * The current batch's taps count, so tapping through a few photos sharpens
+ * judgement on the batch in front of the user rather than only on the next one.
+ */
+export function steeredTaste(
+  candidates: ScoredPhoto[],
+  steering: Steering,
+  remembered: RememberedTaste = NO_TASTE,
+): TasteDirection | null {
+  const liked = new Set(steering.liked);
+  const rejected = new Set(steering.rejected);
+  return tasteDirection(
+    [...remembered.liked, ...embeddingsOf(candidates.filter((p) => liked.has(p.id)))],
+    [...remembered.rejected, ...embeddingsOf(candidates.filter((p) => rejected.has(p.id)))],
+  );
+}
+
+/**
+ * How far a photo sits along the taste direction, as a ranking adjustment.
+ *
+ * Signed: a photo like the ones dropped is pushed down, not merely left alone.
+ * A photo with no embedding gets zero — the neutral middle — because not
+ * knowing what a photo shows is not evidence against it.
+ */
+export function tasteBias(
+  photo: ScoredPhoto,
+  taste: TasteDirection | null | undefined,
+): number {
+  if (!taste || !photo.embedding || photo.embedding.length !== taste.vector.length) {
+    return 0;
+  }
+
+  let projection = 0;
+  for (let i = 0; i < taste.vector.length; i++) {
+    projection += photo.embedding[i] * taste.vector[i];
+  }
+
+  const strength = Math.max(-1, Math.min(1, projection / TASTE_SCALE));
+  return TASTE_WEIGHT * taste.confidence * strength;
+}
+
+/** Projecting this strongly is worth telling the user about. */
+const CLEARLY_TO_TASTE = 0.5;
+
+/** Whether the taste direction is what put this photo up the list. */
+function matchesTaste(photo: ScoredPhoto, taste: TasteDirection | null | undefined): boolean {
+  if (!taste) return false;
+  return tasteBias(photo, taste) >= TASTE_WEIGHT * taste.confidence * CLEARLY_TO_TASTE;
 }
 
 /**
@@ -562,6 +722,7 @@ export function selectWithSteering(
 
   const likedDirection = meanEmbedding(seeds);
   const rejectedPhotos = candidates.filter((photo) => rejected.has(photo.id));
+  const taste = steeredTaste(candidates, steering, remembered);
 
   const valueOf = (photo: ScoredPhoto) => {
     let unwanted = 0;
@@ -570,7 +731,10 @@ export function selectWithSteering(
     }
     const remembersDislike = nearestAffinity(photo, remembered.rejected);
     return (
-      photo.score - REJECT_WEIGHT * unwanted - REMEMBERED_REJECT_WEIGHT * remembersDislike
+      photo.score -
+      REJECT_WEIGHT * unwanted -
+      REMEMBERED_REJECT_WEIGHT * remembersDislike +
+      tasteBias(photo, taste)
     );
   };
 
@@ -625,6 +789,8 @@ export type ExplainContext = {
   remembered: RememberedTaste;
   /** Photo id to how many near-duplicates it beat. */
   alternates: Map<string, number>;
+  /** What the taps have taught, when there is enough of it to have learned. */
+  taste?: TasteDirection | null;
 };
 
 /**
@@ -655,7 +821,12 @@ export function explainPicks(
       reason = "kept";
     } else if (alternates > 0) {
       reason = "best-of-similar";
-    } else if (nearestAffinity(photo, context.remembered.liked) >= CLEARLY_REMEMBERED) {
+    } else if (
+      matchesTaste(photo, context.taste) ||
+      nearestAffinity(photo, context.remembered.liked) >= CLEARLY_REMEMBERED
+    ) {
+      // Two different claims, one honest label: it resembles a photo you kept,
+      // or it sits on the side of the taste direction your keeps are on.
       reason = "like-your-picks";
     } else if (index === 0 || novelty < NOVEL_ENOUGH) {
       reason = "top-quality";
@@ -756,17 +927,27 @@ export function shortlistForEmbedding(
  * boring-but-sharp frame outranks an interesting one with motion blur.
  *
  * Content embeddings (`analysis/embedding.ts`) close part of this: diversity
- * and duplicate detection now spread by subject rather than by colour. What
- * remains missing is *judgement*. The model can say two photos show the same
- * room; it is not asked, and cannot reliably say, which room was worth
- * photographing. Zero-shot prompts for that were tested and rejected — asking
- * for "a beautiful photograph" ranked floor grating above a harbour view.
+ * and duplicate detection now spread by subject rather than by colour. The
+ * taste direction closes another part: once the user has kept and dropped a
+ * few photos, judgement is learned from those taps and applies to everything
+ * that follows.
+ *
+ * What is still missing is judgement for a user who has said nothing yet. The
+ * first batch of the first trip has no taps to learn from, so it is chosen on
+ * technical merit and coverage alone. A *universal* answer would fix that, and
+ * was investigated and set aside: zero-shot aesthetic prompts inverted on real
+ * photos ("a beautiful photograph" ranked floor grating above a harbour view),
+ * Aesthetic Predictor v2.5 ships as a 1.6 GB ONNX graph, and the 3 MB LAION
+ * aesthetic head accepts only 768-dimension input, which means a CLIP ViT-L/14
+ * tower of ~300 MB against our 21 MB MobileCLIP — untenable on a phone where
+ * memory pressure already costs us batches. A small purpose-trained aesthetic
+ * head over MobileCLIP's own 512-dimension output is the shape of the answer;
+ * it does not appear to exist off the shelf.
  *
  * That is also why the count is still governed by a ratio rather than falling
  * out of the quality bar: on technical merit alone, most of a decent batch
  * passes, and "keep everything above the bar" would return nearly everything.
  * Selecting by an absolute bar becomes the right policy once the score
- * captures interestingness — a small on-device aesthetic model (NIMA-style, a
- * few MB via ONNX Runtime Web or TFJS) is the natural next step, at which
+ * captures interestingness for a user who has not taught it anything, at which
  * point MIN/MAX_SELECTION become guardrails rather than the deciding factor.
  */
