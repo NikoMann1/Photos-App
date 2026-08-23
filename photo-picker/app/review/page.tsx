@@ -81,7 +81,10 @@ function Review() {
       // otherwise the ones persisted for the selection. Previews are fine to
       // look at and useless to save, so they are the last resort.
       const remembered = getOriginals(sessionId);
-      const persisted = await loadStoredOriginals(sessionId);
+      // Only read them back when memory is empty — on the common path, right
+      // after an upload, the originals are already here, and reading tens of
+      // megabytes of files back would delay the grid for nothing.
+      const persisted = remembered ? new Map<string, File>() : await loadStoredOriginals(sessionId);
       if (cancelled) return;
 
       const originals = new Map<string, File>([...persisted, ...(remembered ?? [])]);
@@ -176,19 +179,6 @@ function Review() {
       selected.map((photo) => photo.id),
     );
 
-    // Teach the next batch what this one was told, keyed by session so undoing
-    // a tap undoes what was learned from it.
-    const embeddingOf = (id: string) =>
-      data.scored.find((photo) => photo.id === id)?.embedding ?? null;
-    const collect = (ids: string[]) =>
-      ids.map(embeddingOf).filter((e): e is Float32Array => e != null);
-
-    void rememberBatch(
-      data.sessionId,
-      collect(steering.liked),
-      collect(steering.rejected),
-    ).then(setPreferences);
-
     // Steering changes what is selected, so keep the saved originals in step
     // with it — otherwise a photo steering brought in could be shown but not
     // saved after a reload.
@@ -201,6 +191,30 @@ function Review() {
       );
     }
   }, [data, steering, selected]);
+
+  /**
+   * Recording preferences depends only on what the user said, never on what
+   * was selected as a result.
+   *
+   * Sharing an effect with the code above meant that changing preferences
+   * changed the selection, which re-ran this, which read-modify-wrote the
+   * preferences back — so Forget cleared them and then immediately restored
+   * them from the read that was already in flight.
+   */
+  useEffect(() => {
+    if (!data) return;
+
+    const embeddingOf = (id: string) =>
+      data.scored.find((photo) => photo.id === id)?.embedding ?? null;
+    const collect = (ids: string[]) =>
+      ids.map(embeddingOf).filter((e): e is Float32Array => e != null);
+
+    void rememberBatch(
+      data.sessionId,
+      collect(steering.liked),
+      collect(steering.rejected),
+    ).then(setPreferences);
+  }, [data, steering]);
 
   const steer = useCallback((id: string, action: "like" | "reject") => {
     setSteering((current) => {

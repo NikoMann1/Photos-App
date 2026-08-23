@@ -44,6 +44,14 @@ type Status =
 const ANALYZING = "Analyzing";
 const LOOKING = "Looking at";
 
+/**
+ * Everything after the last photo is measured still takes real time —
+ * re-choosing, writing the batch — and it used to happen behind a progress bar
+ * frozen at "36 of 36", which reads as a hang rather than as work. On a phone
+ * that silence is long enough for a user to give up.
+ */
+const FINISHING = "Finishing";
+
 export default function PhotoUploader() {
   const router = useRouter();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -130,6 +138,11 @@ export default function PhotoUploader() {
         );
 
         if (found.size > 1) {
+          setStatus({ phase: "working", label: FINISHING, done: 0, total: 1 });
+          // Yield first: without it the re-selection blocks the main thread
+          // before React can paint the label, and the screen stays frozen on
+          // the last progress line it managed to draw.
+          await nextPaint();
           selection = selectBestPhotos(
             analyzed.map((photo) =>
               found.has(photo.id) ? { ...photo, embedding: found.get(photo.id) } : photo,
@@ -137,6 +150,9 @@ export default function PhotoUploader() {
           );
         }
       }
+
+      setStatus({ phase: "working", label: FINISHING, done: 0, total: 1 });
+      await nextPaint();
 
       const selectedIds = selection.selected.map((photo) => photo.id);
 
@@ -158,13 +174,14 @@ export default function PhotoUploader() {
         selectedIds.push(...unanalyzedIds.slice(0, wanted - selectedIds.length));
       }
 
+      // Photos that can still appear: the pool steering re-chooses from,
+      // whatever is shown, and anything that could not be scored. Photos that
+      // lost to a duplicate or failed the bar are counted, not kept.
+      const keep = new Set([...representativeIds, ...selectedIds, ...unanalyzedIds]);
+
       // Originals stay in memory for this session; only previews are written.
       rememberOriginals(sessionId, new Map(photos.map((photo) => [photo.id, photo.file])));
 
-      // Previews are cheap, but there is still no reason to keep them for
-      // photos that can never appear: those that lost to a duplicate or failed
-      // the quality bar.
-      const keep = new Set([...representativeIds, ...selectedIds, ...unanalyzedIds]);
       const stored: StoredPhoto[] = photos
         .filter((photo) => keep.has(photo.id))
         .map(({ file: _file, ...meta }) => ({
@@ -178,7 +195,12 @@ export default function PhotoUploader() {
         photos: stored,
         totalPhotos: photos.length,
         selectedIds,
-        scores: selection.ranked.map((photo) => ({ ...photo, takenAt: photo.takenAt ?? null })),
+        // Only the pool the review screen can re-choose from, not every photo:
+        // the rest carry embeddings that are never consulted again, and they
+        // are the bulk of what gets cloned into storage.
+        scores: selection.ranked
+          .filter((photo) => keep.has(photo.id))
+          .map((photo) => ({ ...photo, takenAt: photo.takenAt ?? null })),
         representativeIds,
         steering: NO_STEERING,
         duplicateGroups: selection.duplicateGroups.map((group) => ({
@@ -189,9 +211,11 @@ export default function PhotoUploader() {
         unanalyzedIds,
       });
 
-      // Persist the originals behind the selection, so saving survives a
-      // reload — including one iOS does on its own under memory pressure.
-      await storeSelectedOriginals(
+      // Persisting originals is what makes saving survive a reload, but it is
+      // an enhancement, not a prerequisite: the review screen works from the
+      // in-memory copies either way. Writing tens of megabytes of files can be
+      // slow on a phone, so it must not sit between the user and their photos.
+      void storeSelectedOriginals(
         sessionId,
         new Map(photos.map((photo) => [photo.id, photo.file])),
         selectedIds,
@@ -243,7 +267,9 @@ export default function PhotoUploader() {
             <div className="progress-fill" style={{ width: `${percent}%` }} />
           </div>
           <p className="muted">
-            {status.label} {status.done} of {status.total} photos
+            {status.label === FINISHING
+              ? "Finishing up — choosing and saving the batch"
+              : `${status.label} ${status.done} of ${status.total} photos`}
           </p>
         </div>
       )}
@@ -307,6 +333,13 @@ async function uploadToServer(
 
     onProgress(i + batch.length);
   }
+}
+
+/** Lets the browser paint before the next blocking step. */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
 }
 
 function newSessionId(): string {

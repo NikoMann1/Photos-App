@@ -361,6 +361,28 @@ rejection, being unambiguous, is a straight penalty.
 Steering degrades rather than misbehaves without embeddings: the controls only
 appear when the model ran, and pinning and dropping still work if it did not.
 
+## The finishing phase
+
+Work continues after the last photo is measured — re-choosing with embeddings,
+then writing the batch — and it used to happen behind a progress bar frozen at
+"36 of 36". That reads as a hang, not as work, and on a phone the silence is
+long enough to give up on. Measured on 120 photos, that tail was around ten
+seconds on a desktop; a phone with real photos is far worse.
+
+So there is now an explicit **Finishing** phase, and the code yields to a paint
+before the blocking step — otherwise React never gets to draw the label and the
+screen stays frozen on the last line it managed.
+
+Two things also came off the critical path:
+
+- **Persisting originals no longer blocks navigation.** It makes saving survive
+  a reload, but the review screen works from the in-memory copies regardless,
+  so writing tens of megabytes must not sit between the user and their photos.
+- **Only the pool is stored, and only read back when needed.** Scores for
+  photos that can never reappear are dropped rather than cloned into storage,
+  and originals are read back from storage only when the in-memory copies are
+  gone.
+
 ## Known limit: batch size
 
 **Around 175 photos is the practical cap.** 250 was tried on an iPhone and
