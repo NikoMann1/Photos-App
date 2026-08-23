@@ -284,12 +284,52 @@ few times the number of slots — rather than the whole batch.
    against fp16's 21 MB, and its output is noise: a mirrored copy of a photo
    scored 0.349 against it while a flat blue rectangle scored 0.368. fp16
    matches fp32 to three decimals. Do not "optimise" the download by switching.
-2. **Zero-shot aesthetics do not work.** Scoring photos against "a beautiful
-   photograph" versus "a boring snapshot" ranked floor grating above a harbour
-   view, and called the two most photographic images in the batch the most
-   boring. It was tested and dropped.
+2. **Zero-shot aesthetics do not work, in any formulation tried.** Scoring
+   photos against "a beautiful photograph" versus "a boring snapshot" ranked
+   floor grating above a harbour view. A paired direction from eight prompts a
+   side did no better: it spread a real batch over 0.067 where a direction
+   learned from four taps spreads it over 0.9, and its agreement with that
+   learned direction was 0.000. Asked instead what the photos were *of* — the
+   one thing a distilled zero-shot model is trained for — it called a bathroom
+   plaque machinery, floor grating food, and never picked "people" for a photo
+   with people in it. S0's text tower is not the tool; see
+   [Judging content](#judging-content) for what is.
 3. **Threads do not help.** Four WASM threads measured 299 ms against 298 ms
    for one. Parallelism comes from running several photos at once instead.
+
+### Judging content
+
+The model's *image* features do carry judgement even though its text tower
+cannot express it, so the head is learned rather than prompted.
+`lib/analysis/aesthetic.ts` is a ridge regression from MobileCLIP's own
+512-dimension features onto the mean human rating in AVA, trained on 20,437
+rated photographs. On 5,110 held out of training it reaches **Spearman 0.645**
+(Pearson 0.657) — the range published NIMA-class models report on AVA — for
+**2 KB of weights** and one dot product per photo, on top of the model the app
+already downloads. A 512x64x1 network over the same features was tried and is
+worse (0.590, falling as it trains), so it stays linear.
+
+**It is a relative signal.** The head is trained on contest photography, and a
+real phone batch scored 3.97 to 4.77 against AVA's median of 5.42 — an absolute
+threshold would reject an entire camera roll. `contentBaseline` takes the
+batch's own median as the zero point and photos are judged against each other.
+
+On a real batch with no taps at all, it changes the answer:
+
+```
+before (technical + coverage): bunk_empty, person_stairs, harbor_water, yellow_grating, toilet_plaque
+after  (+ content judgement):  person_bunkroom, green_tank, person_stairs, people_on_deck, yellow_grating
+```
+
+Two of the five it used to pick were photos the user had dropped by hand.
+
+**What it does not judge** is whether a subject was worth remembering. It
+rewards composition and light because that is what contest voters reward; on
+the same batch it ranked the torpedo room last, and a torpedo room is what
+someone photographs a submarine tour for. Personal taste corrects that once
+there are taps, and the prior stands aside wherever it can: `personalDamping`
+fades it by half as a taste direction is learned, and to nothing on any photo
+resembling one the user has already kept or dropped.
 
 ### Weights and runtime
 

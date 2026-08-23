@@ -4,10 +4,11 @@
  * The score is *measured*, not learned: focus, exposure, tonal range and colour,
  * computed from the pixels in `lib/analysis/metrics.ts`. That reliably answers
  * "is this photo technically botched?" — blurred, out of focus, badly clipped.
- * It does not answer "was this photo worth taking?", which is a matter of
- * taste; the taste direction further down learns that from the user's own ♥
- * and ✕ taps rather than trying to measure it. See NOT-YET-SOLVED at the
- * bottom of this file for what neither of them covers.
+ * It does not answer "was this photo worth taking?". Two things do, both under
+ * "Judgement" below: a 2 KB head trained on human-rated photographs, which
+ * needs nothing from the user, and a taste direction learned from their own ♥
+ * and ✕ taps, which displaces the general one as it grows. See NOT-YET-SOLVED
+ * at the bottom of this file for what none of them covers.
  *
  * Selection therefore has three stages, in this order:
  *   1. collapse near-duplicates, keeping the best frame of each burst
@@ -18,6 +19,7 @@
  * spends one slot rather than ten.
  */
 
+import { CONTENT_SPREAD, contentScore } from "./analysis/aesthetic";
 import { embeddingSimilarity } from "./analysis/embedding";
 import {
   HASH_BITS,
@@ -686,8 +688,112 @@ export function tasteBias(
   return TASTE_WEIGHT * taste.confidence * strength;
 }
 
+/**
+ * How much a photo's own merit as a photograph moves its ranking.
+ *
+ * Same size as a full-strength personal opinion, for the same reasons, and
+ * checked against the spread a real batch actually has: the user's own photos
+ * span 0.8 points on this head, which at this weight is a gap of 0.117 between
+ * the best-judged and worst-judged photo in the batch — under the 0.15 the
+ * diversity penalty can impose. So across the range a real batch produces,
+ * covering a new subject still beats repeating a well-judged one. There is a
+ * test that fails if this is raised past that.
+ */
+const CONTENT_WEIGHT = 0.12;
+
+/**
+ * How much of the general prior a fully-trained taste direction displaces.
+ * Half, not all: what photographers rate highly stays informative even after
+ * the app knows this user, and a direction is learned from at most a few dozen
+ * taps.
+ *
+ * A photo the user has spoken about *directly* is a different matter — see
+ * `personalDamping`. There the prior gets out of the way entirely.
+ */
+const PERSONAL_DISPLACES = 0.5;
+
+/**
+ * Where a batch sits on the content head's scale, so photos are compared with
+ * each other rather than with a fixed bar.
+ *
+ * This indirection is not optional. The head is trained on contest
+ * photographs and the user's own batch scored 3.97 to 4.77 against AVA's
+ * median of 5.42 — an absolute threshold would reject every photo they own.
+ */
+export type ContentBaseline = {
+  /** Median of the batch: the zero point a photo is judged against. */
+  median: number;
+  /** Upper quartile: above this a photo stands out within its own batch. */
+  standout: number;
+};
+
+export function contentBaseline(photos: ScoredPhoto[]): ContentBaseline | null {
+  const scores = photos
+    .flatMap((photo) => {
+      const score = contentScore(photo.embedding);
+      return score === null ? [] : [score];
+    })
+    .sort((a, b) => a - b);
+
+  // Below a handful of photos there is no distribution to sit in, and the
+  // "median" would just be one arbitrary photo.
+  if (scores.length < 4) return null;
+
+  // The median is interpolated rather than picked: on an even-sized batch
+  // split between good and dull, taking one side's value as the zero point
+  // would leave that whole half judged as merely average.
+  const mid = scores.length >> 1;
+  const median = scores.length % 2 === 1 ? scores[mid] : (scores[mid - 1] + scores[mid]) / 2;
+  const standout = scores[Math.min(scores.length - 1, Math.floor(scores.length * 0.75))];
+  return { median, standout };
+}
+
+/**
+ * How far the general prior should stand back on this particular photo.
+ *
+ * A general prior is what you use in the absence of knowing the person, not
+ * instead of it. So it fades by half as a taste direction is learned, and
+ * fades away completely on a photo that resembles one the user has already
+ * kept or dropped — there, they have answered the question themselves, and a
+ * model trained on contest photography does not get to overrule them.
+ */
+function personalDamping(
+  photo: ScoredPhoto,
+  taste: TasteDirection | null,
+  remembered: RememberedTaste,
+): number {
+  const spokenAbout = Math.max(
+    nearestAffinity(photo, remembered.liked),
+    nearestAffinity(photo, remembered.rejected),
+  );
+  return Math.min(1, Math.max(PERSONAL_DISPLACES * (taste?.confidence ?? 0), spokenAbout));
+}
+
+/**
+ * How this photo compares with the rest of its batch as a photograph, as a
+ * ranking adjustment.
+ */
+export function contentBias(
+  photo: ScoredPhoto,
+  baseline: ContentBaseline | null,
+  damping = 0,
+): number {
+  if (!baseline) return 0;
+  const score = contentScore(photo.embedding);
+  if (score === null) return 0;
+
+  const relative = Math.max(-1, Math.min(1, (score - baseline.median) / (CONTENT_SPREAD / 2)));
+  return CONTENT_WEIGHT * (1 - damping) * relative;
+}
+
 /** Projecting this strongly is worth telling the user about. */
 const CLEARLY_TO_TASTE = 0.5;
+
+/** In the top quarter of its own batch as a photograph. */
+function standsOut(photo: ScoredPhoto, baseline: ContentBaseline | null | undefined): boolean {
+  const score = contentScore(photo.embedding);
+  return Boolean(baseline) && score !== null && score >= baseline!.standout;
+}
 
 /** Whether the taste direction is what put this photo up the list. */
 function matchesTaste(photo: ScoredPhoto, taste: TasteDirection | null | undefined): boolean {
@@ -723,6 +829,7 @@ export function selectWithSteering(
   const likedDirection = meanEmbedding(seeds);
   const rejectedPhotos = candidates.filter((photo) => rejected.has(photo.id));
   const taste = steeredTaste(candidates, steering, remembered);
+  const content = contentBaseline(pool);
 
   const valueOf = (photo: ScoredPhoto) => {
     let unwanted = 0;
@@ -734,7 +841,8 @@ export function selectWithSteering(
       photo.score -
       REJECT_WEIGHT * unwanted -
       REMEMBERED_REJECT_WEIGHT * remembersDislike +
-      tasteBias(photo, taste)
+      tasteBias(photo, taste) +
+      contentBias(photo, content, personalDamping(photo, taste, remembered))
     );
   };
 
@@ -766,6 +874,7 @@ export type PickReason =
   | "kept"
   | "best-of-similar"
   | "like-your-picks"
+  | "well-composed"
   | "top-quality"
   | "different-subject";
 
@@ -773,6 +882,7 @@ export const REASON_LABELS: Record<PickReason, string> = {
   kept: "you kept this",
   "best-of-similar": "best of similar",
   "like-your-picks": "like your picks",
+  "well-composed": "well composed",
   "top-quality": "top quality",
   "different-subject": "different subject",
 };
@@ -791,6 +901,8 @@ export type ExplainContext = {
   alternates: Map<string, number>;
   /** What the taps have taught, when there is enough of it to have learned. */
   taste?: TasteDirection | null;
+  /** Where this batch sits on the content head's scale. */
+  content?: ContentBaseline | null;
 };
 
 /**
@@ -828,6 +940,8 @@ export function explainPicks(
       // Two different claims, one honest label: it resembles a photo you kept,
       // or it sits on the side of the taste direction your keeps are on.
       reason = "like-your-picks";
+    } else if (standsOut(photo, context.content)) {
+      reason = "well-composed";
     } else if (index === 0 || novelty < NOVEL_ENOUGH) {
       reason = "top-quality";
     } else {
@@ -878,7 +992,10 @@ export function selectBestPhotos(
   // The floor exists to stop the *ratio* returning a pointlessly thin
   // selection; it is not a licence to pad with photos the quality bar just
   // rejected. If only four photos are any good, four is the honest answer.
-  const selected = selectDiverse(candidates, target);
+  const content = contentBaseline(candidates);
+  const selected = selectDiverse(candidates, target, [], (photo) =>
+    photo.score + contentBias(photo, content),
+  );
 
   // Unless nothing passed at all — then show the best of a bad batch rather
   // than an empty screen. These keep their `rejectedFor`, so the UI can say why.
@@ -932,22 +1049,28 @@ export function shortlistForEmbedding(
  * few photos, judgement is learned from those taps and applies to everything
  * that follows.
  *
- * What is still missing is judgement for a user who has said nothing yet. The
- * first batch of the first trip has no taps to learn from, so it is chosen on
- * technical merit and coverage alone. A *universal* answer would fix that, and
- * was investigated and set aside: zero-shot aesthetic prompts inverted on real
- * photos ("a beautiful photograph" ranked floor grating above a harbour view),
- * Aesthetic Predictor v2.5 ships as a 1.6 GB ONNX graph, and the 3 MB LAION
- * aesthetic head accepts only 768-dimension input, which means a CLIP ViT-L/14
- * tower of ~300 MB against our 21 MB MobileCLIP — untenable on a phone where
- * memory pressure already costs us batches. A small purpose-trained aesthetic
- * head over MobileCLIP's own 512-dimension output is the shape of the answer;
- * it does not appear to exist off the shelf.
+ * A user who has said nothing yet is covered by the content head in
+ * `analysis/aesthetic.ts`, trained on 20,437 human-rated photographs, which
+ * answers "is this a good photograph?" at Spearman 0.645 on held-out data.
+ *
+ * What none of it answers is "was this worth remembering?" — which for a trip
+ * is the question that matters most, and is not the same question. The head is
+ * trained on contest photography, so it rewards composition and light; on the
+ * user's own batch it ranked a torpedo room last, and a torpedo room is
+ * exactly the sort of thing someone photographs a submarine tour for. Personal
+ * taste corrects that once there are taps, but nothing corrects it before.
+ *
+ * The signal we have and do not use is what the camera already recorded about
+ * the user's attention: how many times they photographed a thing, and how long
+ * they stayed with it. `groupNearDuplicates` counts the retakes and throws the
+ * number away after picking the best frame, and `takenAt` gives the dwell.
+ * Eight attempts at one subject is eight decisions that it mattered — evidence
+ * about what the user cared about that needs no model and no taps.
  *
  * That is also why the count is still governed by a ratio rather than falling
  * out of the quality bar: on technical merit alone, most of a decent batch
  * passes, and "keep everything above the bar" would return nearly everything.
  * Selecting by an absolute bar becomes the right policy once the score
- * captures interestingness for a user who has not taught it anything, at which
- * point MIN/MAX_SELECTION become guardrails rather than the deciding factor.
+ * captures worth rather than execution, at which point MIN/MAX_SELECTION
+ * become guardrails rather than the deciding factor.
  */

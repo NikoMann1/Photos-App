@@ -18,6 +18,7 @@ import {
   explainPicks,
   reasonLabel,
   selectWithSteering,
+  contentBaseline,
   steeredTaste,
   type ScoredPhoto,
   type Steering,
@@ -269,6 +270,7 @@ function Review() {
   const { summary, urls, files, names, types, alternates } = state.data;
   // What the taps so far say about which photos were worth taking.
   const taste = steeredTaste(state.data.pool as unknown as ScoredPhoto[], steering, remembered);
+  const content = contentBaseline(state.data.pool as unknown as ScoredPhoto[]);
   const rememberedCount = countRemembered({
     batches: preferences.batches.filter((batch) => batch.sessionId !== state.data.sessionId),
   });
@@ -290,7 +292,7 @@ function Review() {
   // Why each photo is here, rather than a score: on a real batch every
   // survivor lands within a few hundredths, and the number describes a signal
   // that stopped being the deciding one several changes ago.
-  const reasons = explainPicks(shown, { steering, remembered, alternates, taste });
+  const reasons = explainPicks(shown, { steering, remembered, alternates, taste, content });
 
   const gridPhotos = shown.map((photo) => ({
     id: photo.id,
