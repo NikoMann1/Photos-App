@@ -10,7 +10,12 @@ import {
   type AnalyzedPhoto,
 } from "@/lib/scoring";
 import { analyzePhotos, embedPhotos } from "@/lib/analysis";
-import { isStorageAvailable, saveLatestSession, type StoredPhoto } from "@/lib/browser-session";
+import {
+  isStorageAvailable,
+  rememberOriginals,
+  saveLatestSession,
+  type StoredPhoto,
+} from "@/lib/browser-session";
 
 /**
  * Photos per POST when the server round trip is enabled. Small batches keep any
@@ -64,7 +69,7 @@ export default function PhotoUploader() {
         );
       }
 
-      const photos: StoredPhoto[] = files.map((file, index) => ({
+      const photos = files.map((file, index) => ({
         id: `p${String(index).padStart(4, "0")}`,
         name: file.name || `photo-${index + 1}.jpg`,
         type: file.type || "image/jpeg",
@@ -78,6 +83,8 @@ export default function PhotoUploader() {
         photos.map(({ id, file }) => ({ id, file })),
         (done, total) => setStatus({ phase: "working", label: ANALYZING, done, total }),
       );
+
+      const previews = new Map(analyses.map((result) => [result.id, result.preview]));
 
       // A photo whose pixels wouldn't decode can't be scored. Keep it in the
       // session — it is still the user's photo — but leave it out of ranking
@@ -150,16 +157,24 @@ export default function PhotoUploader() {
         selectedIds.push(...unanalyzedIds.slice(0, wanted - selectedIds.length));
       }
 
-      // Keep the originals only for photos that can still appear: the pool
-      // steering re-chooses from, whatever is currently shown, and anything
-      // that could not be scored. The rest are counted, not stored — full-size
-      // files for photos the user will never see were the bulk of the space.
+      // Originals stay in memory for this session; only previews are written.
+      rememberOriginals(sessionId, new Map(photos.map((photo) => [photo.id, photo.file])));
+
+      // Previews are cheap, but there is still no reason to keep them for
+      // photos that can never appear: those that lost to a duplicate or failed
+      // the quality bar.
       const keep = new Set([...representativeIds, ...selectedIds, ...unanalyzedIds]);
+      const stored: StoredPhoto[] = photos
+        .filter((photo) => keep.has(photo.id))
+        .map(({ file: _file, ...meta }) => ({
+          ...meta,
+          preview: previews.get(meta.id) ?? null,
+        }));
 
       await saveLatestSession({
         sessionId,
         createdAt: Date.now(),
-        photos: photos.filter((photo) => keep.has(photo.id)),
+        photos: stored,
         totalPhotos: photos.length,
         selectedIds,
         scores: selection.ranked.map((photo) => ({ ...photo, takenAt: photo.takenAt ?? null })),

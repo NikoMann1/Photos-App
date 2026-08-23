@@ -6,7 +6,7 @@
  * fails, which bundlers and strict CSPs both manage to cause).
  */
 
-import { canDecodeHere, decodeToPixels, ANALYSIS_SIZE } from "./decode";
+import { canDecodeHere, decodeToPixels, decodeWithPreview, ANALYSIS_SIZE } from "./decode";
 import { readCaptureTime } from "./exif";
 import { computeMetrics, type ImageMetrics } from "./metrics";
 import type { WorkerRequest, WorkerResponse } from "./worker";
@@ -18,6 +18,8 @@ export type AnalysisResult = {
   id: string;
   metrics: ImageMetrics | null;
   takenAt: number | null;
+  /** Small JPEG for storage; originals are kept in memory, never persisted. */
+  preview: Blob | null;
   error?: string;
 };
 
@@ -63,6 +65,7 @@ export async function analyzePhotos(
       id,
       metrics: result?.metrics ?? null,
       takenAt: result?.takenAt ?? null,
+      preview: result?.preview ?? null,
       error: result?.error,
     };
   });
@@ -71,6 +74,7 @@ export async function analyzePhotos(
 type MetricsResult = {
   metrics: ImageMetrics | null;
   takenAt?: number | null;
+  preview?: Blob | null;
   error?: string;
 };
 
@@ -138,7 +142,11 @@ function runInWorker(worker: Worker, input: AnalysisInput): Promise<MetricsResul
       cleanup();
       resolve(
         event.data.ok
-          ? { metrics: event.data.metrics, takenAt: event.data.takenAt }
+          ? {
+              metrics: event.data.metrics,
+              takenAt: event.data.takenAt,
+              preview: event.data.preview,
+            }
           : { metrics: null, error: event.data.error },
       );
     };
@@ -166,7 +174,8 @@ async function analyzeOnMainThread(file: File): Promise<MetricsResult> {
   }
   try {
     const takenAt = await readCaptureTime(file);
-    return { metrics: computeMetrics(await decodeToPixels(file)), takenAt };
+    const { pixels, preview } = await decodeWithPreview(file);
+    return { metrics: computeMetrics(pixels), takenAt, preview };
   } catch (error) {
     return {
       metrics: null,

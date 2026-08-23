@@ -5,7 +5,7 @@
  * decode alone is ~100 ms per photo on a phone.
  */
 
-import { decodeToPixels } from "./decode";
+import { decodeWithPreview } from "./decode";
 import { parseCaptureTime } from "./exif";
 import { computeMetrics, type ImageMetrics } from "./metrics";
 
@@ -14,7 +14,14 @@ const HEADER_BYTES = 256 * 1024;
 
 export type WorkerRequest = { id: string; blob: Blob; maxSize?: number };
 export type WorkerResponse =
-  | { id: string; ok: true; metrics: ImageMetrics; takenAt: number | null }
+  | {
+      id: string;
+      ok: true;
+      metrics: ImageMetrics;
+      takenAt: number | null;
+      /** Small JPEG for storage; the original is never persisted. */
+      preview: Blob | null;
+    }
   | { id: string; ok: false; error: string };
 
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
@@ -32,12 +39,13 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       takenAt = null;
     }
 
-    const pixels = await decodeToPixels(blob, maxSize);
+    const { pixels, preview } = await decodeWithPreview(blob, maxSize);
     const response: WorkerResponse = {
       id,
       ok: true,
       metrics: computeMetrics(pixels),
       takenAt,
+      preview,
     };
     self.postMessage(response);
   } catch (error) {

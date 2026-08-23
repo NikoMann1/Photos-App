@@ -303,17 +303,25 @@ to colour, layout and time, which is covered by a test.
 
 ## Storage
 
-Only the newest batch is kept, and within it only the photos that can still be
-displayed: the pool steering re-chooses from, whatever is currently shown, and
-anything that could not be scored.
+**Original photos are never written to storage.** A picked file is already held
+by the browser outside this origin's quota; copying it into IndexedDB is what
+consumes the budget, and a 500-photo batch off a phone is well over a gigabyte
+— far past what iOS grants a website. Exceeding that quota does not surface as
+an error the user can see: the photo picker simply stops closing when Add is
+tapped, because the newly picked files cannot be staged.
 
-This is deliberate rather than tidy-mindedness. Photos are stored as their
-original files, so a 50-photo batch off an iPhone is 150 MB or more. Keeping
-previous batches meant every upload added another copy of that; keeping every
-photo meant storing full-size originals for photos the user would never see.
-Once an origin's storage is exhausted, writes fail — and on iOS the symptom is
-not an error message but the photo picker refusing to close when you tap Add,
-because the newly picked files cannot be staged.
+So what persists is a ~40 KB JPEG preview per photo, re-encoded from the canvas
+the analysis already drew (one extra encode, no second decode), plus scores and
+embeddings. Measured: a 180 MB batch persists as **0.07 MB**. Only the newest
+batch is kept, and within it only photos that can still appear — the pool
+steering re-chooses from, whatever is shown, and anything that could not be
+scored.
+
+Originals stay in memory for the session. That survives navigating from the
+upload screen to the review screen, but not a reload — the deliberate trade.
+After a reload the grid still renders from previews and the review screen says
+that saving needs the photos picked again, because handing a downscaled preview
+to the camera roll would be worse than saying so.
 
 If a save still fails for space, storage is cleared and the save retried once.
 

@@ -6,6 +6,7 @@ import { useSearchParams } from "next/navigation";
 import PhotoGrid from "@/components/PhotoGrid";
 import SaveToPhotosButton, { type SharePhoto } from "@/components/SaveToPhotosButton";
 import {
+  getOriginals,
   loadSession,
   updateSteering,
   type BrowserSession,
@@ -20,6 +21,11 @@ type Summary = {
   collapsedCount: number;
   unanalyzedCount: number;
   steerable: boolean;
+  /**
+   * False after a reload: the grid still renders from previews, but the
+   * full-quality originals are gone, so saving needs the photos picked again.
+   */
+  canSave: boolean;
 };
 
 type Loaded = {
@@ -59,15 +65,23 @@ function Review() {
         return;
       }
 
+      // Originals if this is the same page load that picked them; previews
+      // otherwise. Previews are fine to look at and useless to save.
+      const originals = getOriginals(sessionId);
       const urls = new Map<string, string>();
       const files = new Map<string, File>();
       const names = new Map<string, string>();
       const types = new Map<string, string>();
+
       for (const photo of session.photos) {
-        const url = URL.createObjectURL(photo.file);
+        const original = originals?.get(photo.id) ?? null;
+        const source = original ?? photo.preview;
+        if (!source) continue;
+
+        const url = URL.createObjectURL(source);
         created.push(url);
         urls.set(photo.id, url);
-        files.set(photo.id, photo.file);
+        if (original) files.set(photo.id, original);
         names.set(photo.id, photo.name);
         types.set(photo.id, photo.type);
       }
@@ -100,6 +114,7 @@ function Review() {
             // Steering needs embeddings to reason about; without them a tap
             // could only pin and drop, which is not worth the interface.
             steerable: session.scores.some((photo) => photo.embedding),
+            canSave: files.size > 0,
           },
         },
       });
@@ -171,11 +186,12 @@ function Review() {
   const { summary, urls, files, names, types } = state.data;
   const likedIds = new Set(steering.liked);
 
-  // Defensive: a scored id with no file behind it would hand undefined to the
-  // share sheet. It should not happen, but it must not be able to.
-  const shown = selected.filter((photo) => files.has(photo.id) && urls.has(photo.id));
+  // The grid renders from whatever is available; only photos with an original
+  // behind them can be handed to the share sheet.
+  const shown = selected.filter((photo) => urls.has(photo.id));
+  const saveable = shown.filter((photo) => files.has(photo.id));
 
-  const sharePhotos: SharePhoto[] = shown.map((photo) => ({
+  const sharePhotos: SharePhoto[] = saveable.map((photo) => ({
     id: photo.id,
     name: names.get(photo.id) ?? `${photo.id}.jpg`,
     type: types.get(photo.id) ?? "image/jpeg",
@@ -247,7 +263,15 @@ function Review() {
         )}
       </div>
 
-      <SaveToPhotosButton photos={sharePhotos} />
+      {summary.canSave ? (
+        <SaveToPhotosButton photos={sharePhotos} />
+      ) : (
+        <p className="muted small">
+          These are stored previews — the full-quality photos aren’t kept on the device
+          after a reload, because a batch of them is far more than a website is allowed
+          to store. Pick the batch again to save it to your camera roll.
+        </p>
+      )}
 
       <Link className="button" href="/">
         Upload another batch
