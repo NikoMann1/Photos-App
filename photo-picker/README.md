@@ -301,6 +301,25 @@ binaries do not belong in a git repository. To self-host, serve them and set
 If either fetch fails the app still works: photos without embeddings fall back
 to colour, layout and time, which is covered by a test.
 
+## IndexedDB: issue every request before awaiting
+
+A transaction goes inactive as soon as control returns to the event loop with
+no request outstanding, so a request issued *after* an `await` inside the same
+transaction throws `TransactionInactiveError`.
+
+Chromium is lenient about this. Safari is not — which produced the worst bug in
+this project: reading the saved originals awaited `getAllKeys()` and then issued
+`get()` per key, so on the phone it threw, the surrounding `catch` returned an
+empty map, and every saved photo looked missing. The save button vanished and
+the screen blamed a reload. It passed every browser test here, three times.
+
+The rule is now enforced by `browser-session.test.ts`, which runs the two
+patterns against a deliberately strict in-memory IndexedDB that deactivates a
+transaction the moment its success callback returns. The old pattern fails that
+test; the current one passes.
+
+When a read has to inform a write, do the read in its own transaction first.
+
 ## Storage
 
 **Original photos are never written to storage.** A picked file is already held
