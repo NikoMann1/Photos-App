@@ -63,8 +63,18 @@ export function fitWithin(
  * ANALYSIS_SIZE. Deliberately no separate size constant: it would either be
  * ignored or force a second redraw for no benefit. At 512px a preview is tens
  * of kilobytes and still fills a grid tile on a dense phone screen.
+ *
+ * The quality is set by what the *embedding* stage needs, not by what looks
+ * acceptable in a grid tile — since that stage now reads previews rather than
+ * re-decoding originals. Measured over 40 full-resolution photos, embedding a
+ * preview instead of the original agrees with it 0.9899 at quality 0.72 and
+ * 0.9976 at 0.90, which sounds like a rounding difference and is not: the
+ * content score drifts 0.196 AVA points at 0.72 against a real batch's total
+ * spread of 0.8, and two of five picks changed. At 0.90 the selection is
+ * identical to the full-resolution one. Previews roughly double, from 11 KB to
+ * 22 KB, which buys back a 48 MB decode per shortlisted photo.
  */
-const PREVIEW_QUALITY = 0.72;
+const PREVIEW_QUALITY = 0.9;
 
 /**
  * Encodes what is already on the canvas, so a preview costs one JPEG encode

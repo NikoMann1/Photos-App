@@ -168,11 +168,14 @@ export default function PhotoUploader() {
       // back to the cheap similarity signals.
       const shortlist = shortlistForEmbedding(selection);
       if (shortlist.length > 1) {
-        const byId = new Map(photos.map((photo) => [photo.id, photo.file]));
+        // Previews, not originals: this stage already holds the model and the
+        // WASM heap, and a 12 MP decode on top of that is what iOS was killing
+        // the tab over. A photo with no preview had no metrics either, so it
+        // cannot be on the shortlist.
         const embeddings = await embedPhotos(
           shortlist
-            .map((photo) => ({ id: photo.id, file: byId.get(photo.id) }))
-            .filter((input): input is { id: string; file: File } => input.file !== undefined),
+            .map((photo) => ({ id: photo.id, source: previews.get(photo.id) }))
+            .filter((input): input is { id: string; source: Blob } => Boolean(input.source)),
           (done, total) => setStatus({ phase: "working", label: LOOKING, done, total }),
         );
 

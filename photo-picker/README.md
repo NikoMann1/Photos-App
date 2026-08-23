@@ -487,12 +487,26 @@ Ruled out: **storage** (originals are no longer persisted, so a 250-photo batch
 writes ~10 MB of previews) and **the iOS import step** (the crash happens well
 after import, during embedding).
 
-What is left is peak memory in the embedding stage, and the next lever is
-decoding at reduced resolution so a worker never holds a ~48 MB full-resolution
-bitmap. That wants care rather than enthusiasm: decoding smaller is itself a
-blur, and the focus thresholds in `scoring.ts` were calibrated at 512px, so the
-blur measurements would have to be re-checked against the new size before
-trusting anything the scorer says.
+The embedding stage no longer decodes originals at all. It reads stage one's
+512px preview, which is already in memory for the grid, so the ~48 MB bitmap
+that used to sit alongside the model and the WASM heap is simply gone. Measured
+in a browser over 20 full-resolution photos, warm: **234 ms and a ~48 MB bitmap
+per photo becomes 5.6 ms and ~1 MB.**
+
+This is not free, and the price is paid in preview quality rather than in
+memory. Embedding a preview instead of the original agrees with it 0.9899 at
+quality 0.72 — which sounds like nothing and is not. The content score drifts
+0.196 AVA points against a real batch's total spread of 0.8, and on a 40-photo
+batch two of five picks changed. Quality 0.82 was still wrong by the same two
+photos. At 0.90 the selection is identical to the full-resolution one, so that
+is where `PREVIEW_QUALITY` sits; previews roughly double, 11 KB to 22 KB.
+
+What is left is stage one, which still decodes every photo at full resolution
+and holds up to three of those bitmaps at once. The lever there is decoding at
+reduced resolution, and it wants care rather than enthusiasm: decoding smaller
+is itself a blur, and the focus thresholds in `scoring.ts` were calibrated at
+512px, so the blur measurements would have to be re-checked against the new
+size before trusting anything the scorer says.
 
 ## Saying why a photo was picked
 
